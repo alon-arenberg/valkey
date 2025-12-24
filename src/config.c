@@ -3308,6 +3308,7 @@ standardConfig static_configs[] = {
     createBoolConfig("lua-enable-insecure-api", "lua-enable-deprecated-api", MODIFIABLE_CONFIG | HIDDEN_CONFIG | PROTECTED_CONFIG, server.lua_enable_insecure_api, 0, NULL, updateLuaEnableInsecureApi),
     createBoolConfig("import-mode", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.import_mode, 0, NULL, NULL),
     createBoolConfig("io-threads-always-active", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_always_active, 0, NULL, NULL),
+    createBoolConfig("hotkey-enabled", NULL, MODIFIABLE_CONFIG, server.hotkey_enabled, 0, NULL, hotKeyEnabledCallback),
 
     /* String Configs */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),
@@ -3419,6 +3420,11 @@ standardConfig static_configs[] = {
     createIntConfig("rdma-rx-size", NULL, IMMUTABLE_CONFIG, 64 * 1024, 16 * 1024 * 1024, server.rdma_ctx_config.rx_size, 1024 * 1024, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("rdma-completion-vector", NULL, IMMUTABLE_CONFIG, -1, 1024, server.rdma_ctx_config.completion_vector, -1, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("cluster-message-gossip-perc", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 100, server.cluster_message_gossip_perc, 10, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("hotkey-sampling-ratio", NULL, MODIFIABLE_CONFIG, 1, 100, server.hotkey_sampling_ratio, 1, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("hotkey-max-keys", NULL, MODIFIABLE_CONFIG, 1, 1000, server.hotkey_max_keys, 16, INTEGER_CONFIG, NULL, hotKeyMaxKeysCallback),
+    createIntConfig("hotkey-window-seconds", NULL, MODIFIABLE_CONFIG, 1, 10, server.hotkey_window_seconds, 1, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("hotkey-history-max-count", NULL, MODIFIABLE_CONFIG, 1, 30, server.hotkey_history_max_count, 3, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("hotkey-history-ttl", NULL, MODIFIABLE_CONFIG, 1, 3600, server.hotkey_history_ttl, 600, INTEGER_CONFIG, NULL, NULL),
 
     /* Unsigned int configs */
     createUIntConfig("maxclients", NULL, MODIFIABLE_CONFIG, 1, UINT_MAX, server.maxclients, 10000, INTEGER_CONFIG, NULL, updateMaxclients),

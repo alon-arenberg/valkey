@@ -122,6 +122,18 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
         /* TODO: Use separate misses stats and notify event for WRITE */
     }
 
+    /* If the hot key detection function is enabled and the hot key sampling rate is reached,
+     * hot key statistics will be performed. */
+    if (server.hotkey_enabled && (rand() % 100) < server.hotkey_sampling_ratio) {
+        int obj_type = val ? val->type : OBJ_STRING;
+        int hotkey_slot = server.cluster_enabled ? keyHashSlot(objectGetVal(key), stringObjectLen(key)) : 0;
+        if (flags & LOOKUP_WRITE) {
+            writeHotKeyDetection(key, obj_type, hotkey_slot);
+        } else {
+            readHotKeyDetection(key, obj_type, hotkey_slot);
+        }
+    }
+
     return val;
 }
 
@@ -681,6 +693,9 @@ long long emptyData(int dbnum, int flags, void(callback)(hashtable *)) {
 
     /* Empty the database structure. */
     removed = emptyDbStructure(server.db, dbnum, async, callback);
+
+    /* Purge all hot key detection state since keys are gone. */
+    hotkeyPurgeAll();
 
     if (dbnum == -1) flushReplicaKeysWithExpireList(async);
 

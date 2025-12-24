@@ -1,0 +1,28 @@
+{
+    "PURGE": {
+        "summary": "Purge hot key detection state for a specific slot",
+        "complexity": "O(N) where N is the number of history entries to scan",
+        "group": "server",
+        "since": "9.0.0",
+        "arity": 4,
+        "function": "hotkeysPurgeCommand",
+        "command_flags": [
+            "ADMIN",
+            "LOADING",
+            "STALE"
+        ],
+        "acl_categories": [
+            "ADMIN",
+            "DANGEROUS",
+            "SLOW"
+        ],
+        "container": "HOTKEYS",
+        "arguments": [
+            {
+                "name": "slot",
+                "type": "integer",
+                "token": "SLOT"
+            }
+        ]
+    }
+}

@@ -1722,6 +1722,62 @@ typedef struct {
 } aofManifest;
 
 /*-----------------------------------------------------------------------------
+ * Hotkey definition — Misra-Gries based hot key detection
+ *----------------------------------------------------------------------------*/
+
+/* Hotkey history record entry (hash table value) */
+typedef struct {
+    uint64_t peak_qps;     /* Peak QPS */
+    time_t first_detected; /* First detection time */
+    time_t last_detected;  /* Last detection time */
+    int is_read;           /* 1: read hotkey, 0: write hotkey */
+    uint32_t duration;     /* Duration in seconds */
+    int val_type;          /* Value type (string, hash, etc.) */
+    int slot;              /* Hash slot this key belongs to */
+} hotkeyHistoryEntry;
+
+/* LRU linked list node */
+typedef struct hotkeyLRUNode {
+    struct hotkeyLRUNode *prev;
+    struct hotkeyLRUNode *next;
+    sds key;                   /* Hotkey name */
+    hotkeyHistoryEntry *entry; /* Hotkey history record */
+} hotkeyLRUNode;
+
+/* LRU linked list manager */
+typedef struct {
+    hotkeyLRUNode *head; /* List head (newest) */
+    hotkeyLRUNode *tail; /* List tail (oldest) */
+    size_t size;         /* Current node count */
+} hotkeyLRU;
+
+/* Number of hash slots for per-slot hotkey tracking (matches cluster slot count) */
+#define HOTKEY_SLOTS 16384
+
+/* Misra-Gries summary entry (stored inline in flat array) */
+typedef struct {
+    sds key;         /* Key name (NULL = empty slot) */
+    uint64_t count;  /* Current counter value */
+    int val_type;    /* Value type (OBJ_TYPE_*) */
+} hotkeyMGEntry;
+
+/* Misra-Gries summary: flat array of at most max_keys entries */
+typedef struct {
+    hotkeyMGEntry *entries; /* Fixed-size array of max_keys entries */
+    int max_keys;           /* Capacity (k) */
+    int size;               /* Current number of active entries */
+    uint64_t total;         /* Total observations in current window */
+} hotkeyMGSummary;
+
+/* Hotkey manager: per-slot Misra-Gries summaries + global history */
+typedef struct {
+    hotkeyMGSummary *read_summaries[HOTKEY_SLOTS];   /* Per-slot, lazily allocated */
+    hotkeyMGSummary *write_summaries[HOTKEY_SLOTS];  /* Per-slot, lazily allocated */
+    dict *history_dict;     /* sds key -> hotkeyLRUNode* */
+    hotkeyLRU *history_lru; /* LRU list for history */
+} hotkeyManager;
+
+/*-----------------------------------------------------------------------------
  * Global server state
  *----------------------------------------------------------------------------*/
 
@@ -2388,6 +2444,19 @@ struct valkeyServer {
     /* Local environment */
     char *locale_collate;
     char *debug_context; /* A free-form string that has no impact on server except being included in a crash report. */
+
+    /* Hotkey parameters (Misra-Gries based detection) */
+    int hotkey_enabled;                              /* Globally control the enabling / disabling of the hot key detection function. */
+    int hotkey_sampling_ratio;                       /* The ratio of hotkey sampling (1-100%). */
+    int hotkey_max_keys;                             /* Max tracked keys per slot (k). */
+    int hotkey_window_seconds;                       /* The time window size of hotkey detection. */
+    int hotkey_history_max_count;                    /* The maximum number of historical cached hot keys. */
+    int hotkey_history_ttl;                          /* The time to live of the cached hot keys. */
+    unsigned long long hotkey_runtime_total_sampled; /* Total number of sampled keys */
+    unsigned long long hotkey_runtime_read_count;    /* Total number of read hot keys detected. */
+    unsigned long long hotkey_runtime_write_count;   /* Total number of write hot keys detected. */
+    unsigned int hotkey_runtime_history_count;       /* Total number of history hot keys cached. */
+    hotkeyManager *hotkey_manager;
 };
 
 #define MAX_KEYS_BUFFER 256
@@ -2832,6 +2901,7 @@ extern hashtableType hashWithVolatileItemsHashtableType;
 extern dictType stringSetDictType;
 extern dictType externalStringType;
 extern dictType sdsHashDictType;
+extern dictType hotkeyHistoryDictType;
 extern hashtableType clientHashtableType;
 extern hashtableType kvstoreChannelHashtableType;
 extern dictType modulesDictType;
@@ -4230,6 +4300,25 @@ void lcsCommand(client *c);
 void quitCommand(client *c);
 void resetCommand(client *c);
 void failoverCommand(client *c);
+void hotkeysCommand(client *c);
+void hotkeysGetCommand(client *c);
+void hotkeysResetCommand(client *c);
+void hotkeysPurgeCommand(client *c);
+
+/* Hotkey (Misra-Gries) */
+int hotKeyEnabledCallback(const char **err);
+int hotKeyMaxKeysCallback(const char **err);
+hotkeyMGSummary *hotkeyMGSummaryNew(int max_keys);
+void hotkeyMGSummaryFree(hotkeyMGSummary *s);
+hotkeyManager *hotkeyManagerInit(int max_keys);
+void hotkeyManagerFree(hotkeyManager *manager);
+void hotkeyManagerReset(hotkeyManager *manager);
+void addHotkeyToHistory(hotkeyManager *manager);
+void expireHotkeyHistory(hotkeyManager *manager);
+void writeHotKeyDetection(robj *key, int val_type, int slot);
+void readHotKeyDetection(robj *key, int val_type, int slot);
+void hotkeyPurgeSlot(int slot);
+void hotkeyPurgeAll(void);
 
 /* Helper functions for getting database id args from argv, argc */
 int *selectDbIdArgs(robj **argv, int argc, int *count);
