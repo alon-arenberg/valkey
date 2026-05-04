@@ -1,85 +1,85 @@
 #include "server.h"
 
 /*-----------------------------------------------------------------------------
- * Misra-Gries summary for hot key detection — per-slot variant
+ * Misra-Gries summary for hot key detection — flat-array variant
  *
- * Each slot gets its own lazily-allocated read/write MG summary.
- * History is global (single LRU) with slot annotation on each entry.
+ * Uses a fixed-size array of k entries instead of a dict. For small k
+ * (default 16), linear scan is faster than dict hash+pointer-chase and
+ * the entire working set fits in L1 cache (~1KB).
  *----------------------------------------------------------------------------*/
 
 /* ---- Misra-Gries summary operations ---- */
 
 hotkeyMGSummary *hotkeyMGSummaryNew(int max_keys) {
     hotkeyMGSummary *s = zcalloc(sizeof(hotkeyMGSummary));
-    s->counters = dictCreate(&hotKeyMGDictType);
+    s->entries = zcalloc(max_keys * sizeof(hotkeyMGEntry));
     s->max_keys = max_keys;
+    s->size = 0;
     s->total = 0;
     return s;
 }
 
 void hotkeyMGSummaryFree(hotkeyMGSummary *s) {
     if (!s) return;
-    if (s->counters) dictRelease(s->counters);
+    for (int i = 0; i < s->size; i++) {
+        if (s->entries[i].key) sdsfree(s->entries[i].key);
+    }
+    zfree(s->entries);
     zfree(s);
 }
 
 void hotkeyMGSummaryReset(hotkeyMGSummary *s) {
     if (!s) return;
-    dictEmpty(s->counters, NULL);
+    for (int i = 0; i < s->size; i++) {
+        if (s->entries[i].key) sdsfree(s->entries[i].key);
+        s->entries[i].key = NULL;
+        s->entries[i].count = 0;
+    }
+    s->size = 0;
     s->total = 0;
-}
-
-void hotkeyMGSummaryAdd(hotkeyMGSummary *s, robj *key) {
-    if (!s || !key || !objectGetVal(key)) return;
-    s->total++;
-    const char *k = objectGetVal(key);
-
-    dictEntry *de = dictFind(s->counters, k);
-    if (de) { ((hotkeyMGEntry *)dictGetVal(de))->count++; return; }
-
-    if ((long long)dictSize(s->counters) < s->max_keys) {
-        hotkeyMGEntry *e = zcalloc(sizeof(hotkeyMGEntry));
-        e->count = 1;
-        e->val_type = OBJ_STRING;
-        dictAdd(s->counters, sdsnew(k), e);
-        return;
-    }
-
-    dictIterator *di = dictGetSafeIterator(s->counters);
-    while ((de = dictNext(di)) != NULL) {
-        hotkeyMGEntry *e = dictGetVal(de);
-        if (--e->count == 0) dictDelete(s->counters, dictGetKey(de));
-    }
-    dictReleaseIterator(di);
 }
 
 void hotkeyMGSummaryAddTyped(hotkeyMGSummary *s, robj *key, int val_type) {
     if (!s || !key || !objectGetVal(key)) return;
+
     s->total++;
     const char *k = objectGetVal(key);
+    size_t klen = sdslen(objectGetVal(key));
 
-    dictEntry *de = dictFind(s->counters, k);
-    if (de) {
-        hotkeyMGEntry *e = dictGetVal(de);
-        e->count++;
-        e->val_type = val_type;
+    /* Case 1: key already tracked — linear scan */
+    for (int i = 0; i < s->size; i++) {
+        if (s->entries[i].key && sdslen(s->entries[i].key) == klen &&
+            memcmp(s->entries[i].key, k, klen) == 0) {
+            s->entries[i].count++;
+            s->entries[i].val_type = val_type;
+            return;
+        }
+    }
+
+    /* Case 2: room available — append */
+    if (s->size < s->max_keys) {
+        s->entries[s->size].key = sdsnewlen(k, klen);
+        s->entries[s->size].count = 1;
+        s->entries[s->size].val_type = val_type;
+        s->size++;
         return;
     }
 
-    if ((long long)dictSize(s->counters) < s->max_keys) {
-        hotkeyMGEntry *e = zcalloc(sizeof(hotkeyMGEntry));
-        e->count = 1;
-        e->val_type = val_type;
-        dictAdd(s->counters, sdsnew(k), e);
-        return;
+    /* Case 3: full — decrement all, compact out zeros */
+    int write = 0;
+    for (int i = 0; i < s->size; i++) {
+        s->entries[i].count--;
+        if (s->entries[i].count > 0) {
+            if (write != i) {
+                s->entries[write] = s->entries[i];
+            }
+            write++;
+        } else {
+            sdsfree(s->entries[i].key);
+            s->entries[i].key = NULL;
+        }
     }
-
-    dictIterator *di = dictGetSafeIterator(s->counters);
-    while ((de = dictNext(di)) != NULL) {
-        hotkeyMGEntry *e = dictGetVal(de);
-        if (--e->count == 0) dictDelete(s->counters, dictGetKey(de));
-    }
-    dictReleaseIterator(di);
+    s->size = write;
 }
 
 /* ---- Manager lifecycle ---- */
@@ -87,7 +87,6 @@ void hotkeyMGSummaryAddTyped(hotkeyMGSummary *s, robj *key, int val_type) {
 hotkeyMGManager *hotkeyMGManagerInit(int max_keys) {
     UNUSED(max_keys);
     hotkeyMGManager *m = zcalloc(sizeof(hotkeyMGManager));
-    /* Per-slot arrays are zero-initialized (NULL) by zcalloc — lazy allocation */
     m->history_dict = dictCreate(&hotkeyMGHistoryDictType);
     m->history_lru = zcalloc(sizeof(hotkeyLRU));
     return m;
@@ -148,8 +147,7 @@ static void mgLRUMoveToHead(hotkeyLRU *lru, hotkeyLRUNode *node) {
 
 static hotkeyLRUNode *mgLRUAddToHead(hotkeyLRU *lru, sds key, hotkeyHistoryEntry *entry) {
     hotkeyLRUNode *node = zcalloc(sizeof(hotkeyLRUNode));
-    node->key = key;
-    node->entry = entry;
+    node->key = key; node->entry = entry;
     node->next = lru->head;
     if (lru->head) lru->head->prev = node;
     lru->head = node;
@@ -210,26 +208,19 @@ static void mgAddSingleToHistory(hotkeyMGManager *m, const char *key_str, uint64
     }
 
     hotkeyHistoryEntry *h = zcalloc(sizeof(hotkeyHistoryEntry));
-    h->peak_qps = qps;
-    h->first_detected = now;
-    h->last_detected = now;
-    h->is_read = is_read;
-    h->duration = server.hotkey_window_seconds;
-    h->val_type = val_type;
-    h->slot = slot;
+    h->peak_qps = qps; h->first_detected = now; h->last_detected = now;
+    h->is_read = is_read; h->duration = server.hotkey_window_seconds;
+    h->val_type = val_type; h->slot = slot;
 
     sds ks = sdsnew(key_str);
     hotkeyLRUNode *node = mgLRUAddToHead(m->history_lru, ks, h);
     if (dictAdd(m->history_dict, ks, node) != DICT_OK) {
         if (m->history_lru->head == node) {
             m->history_lru->head = node->next;
-            if (node->next) node->next->prev = NULL;
-            else m->history_lru->tail = NULL;
+            if (node->next) node->next->prev = NULL; else m->history_lru->tail = NULL;
             m->history_lru->size--;
         }
-        sdsfree(ks);
-        zfree(h);
-        zfree(node);
+        sdsfree(ks); zfree(h); zfree(node);
     }
 }
 
@@ -238,25 +229,21 @@ void addHotkeyMGToHistory(hotkeyMGManager *m) {
     if (!m) return;
 
     for (int slot = 0; slot < HOTKEY_SLOTS; slot++) {
-        if (m->read_summaries[slot] && dictSize(m->read_summaries[slot]->counters) > 0) {
-            dictIterator *di = dictGetIterator(m->read_summaries[slot]->counters);
-            dictEntry *de;
-            while ((de = dictNext(di)) != NULL) {
-                hotkeyMGEntry *e = dictGetVal(de);
-                mgAddSingleToHistory(m, dictGetKey(de), e->count, e->val_type, 1, slot);
+        hotkeyMGSummary *rs = m->read_summaries[slot];
+        if (rs && rs->size > 0) {
+            for (int i = 0; i < rs->size; i++) {
+                if (!rs->entries[i].key) continue;
+                mgAddSingleToHistory(m, rs->entries[i].key, rs->entries[i].count, rs->entries[i].val_type, 1, slot);
                 server.hotkey_mg_runtime_read_count++;
             }
-            dictReleaseIterator(di);
         }
-        if (m->write_summaries[slot] && dictSize(m->write_summaries[slot]->counters) > 0) {
-            dictIterator *di = dictGetIterator(m->write_summaries[slot]->counters);
-            dictEntry *de;
-            while ((de = dictNext(di)) != NULL) {
-                hotkeyMGEntry *e = dictGetVal(de);
-                mgAddSingleToHistory(m, dictGetKey(de), e->count, e->val_type, 0, slot);
+        hotkeyMGSummary *ws = m->write_summaries[slot];
+        if (ws && ws->size > 0) {
+            for (int i = 0; i < ws->size; i++) {
+                if (!ws->entries[i].key) continue;
+                mgAddSingleToHistory(m, ws->entries[i].key, ws->entries[i].count, ws->entries[i].val_type, 0, slot);
                 server.hotkey_mg_runtime_write_count++;
             }
-            dictReleaseIterator(di);
         }
     }
 
@@ -270,15 +257,11 @@ void expireHotkeyMGHistory(hotkeyMGManager *m) {
     while (cur) {
         hotkeyLRUNode *prev = cur->prev;
         if (cur->entry && cur->entry->last_detected < expire) {
-            if (cur->prev) cur->prev->next = cur->next;
-            else m->history_lru->head = cur->next;
-            if (cur->next) cur->next->prev = cur->prev;
-            else m->history_lru->tail = cur->prev;
+            if (cur->prev) cur->prev->next = cur->next; else m->history_lru->head = cur->next;
+            if (cur->next) cur->next->prev = cur->prev; else m->history_lru->tail = cur->prev;
             m->history_lru->size--;
             if (cur->key) dictDelete(m->history_dict, cur->key);
-        } else {
-            break;
-        }
+        } else break;
         cur = prev;
     }
     server.hotkey_mg_runtime_history_count = m->history_lru->size;
@@ -286,58 +269,33 @@ void expireHotkeyMGHistory(hotkeyMGManager *m) {
 
 /* ---- Commands ---- */
 
-/* Declared in hotkey.c — shared filter parser */
 extern int parseHotkeyFilterArgs(client *c, int start_idx, int *filter_type, int *filter_slot);
 extern int matchesFilter(hotkeyHistoryEntry *e, int filter_type, int filter_slot);
 extern void replyWithHotkeyEntry(client *c, hotkeyLRUNode *node);
 
-/* HOTKEYS MG [SLOT <n>] [TYPE {read|write|all}] */
 void hotkeysMGGetCommand(client *c) {
-    if (!server.hotkey_mg_enabled) {
-        addReplyError(c, "Hotkey MG detection is disabled");
-        return;
-    }
-    if (!server.hotkey_mg_manager || !server.hotkey_mg_manager->history_lru) {
-        addReplyArrayLen(c, 0);
-        return;
-    }
-
+    if (!server.hotkey_mg_enabled) { addReplyError(c, "Hotkey MG detection is disabled"); return; }
+    if (!server.hotkey_mg_manager || !server.hotkey_mg_manager->history_lru) { addReplyArrayLen(c, 0); return; }
     int filter_type, filter_slot;
     if (!parseHotkeyFilterArgs(c, 2, &filter_type, &filter_slot)) return;
-
     expireHotkeyMGHistory(server.hotkey_mg_manager);
-
-    if (!server.hotkey_mg_manager || !server.hotkey_mg_manager->history_lru) {
-        addReplyArrayLen(c, 0);
-        return;
-    }
-
+    if (!server.hotkey_mg_manager || !server.hotkey_mg_manager->history_lru) { addReplyArrayLen(c, 0); return; }
     int count = 0;
     hotkeyLRUNode *cur = server.hotkey_mg_manager->history_lru->head;
-    while (cur) {
-        if (matchesFilter(cur->entry, filter_type, filter_slot)) count++;
-        cur = cur->next;
-    }
-
+    while (cur) { if (matchesFilter(cur->entry, filter_type, filter_slot)) count++; cur = cur->next; }
     addReplyArrayLen(c, count);
     cur = server.hotkey_mg_manager->history_lru->head;
     while (cur) {
-        if (cur->entry && cur->key && matchesFilter(cur->entry, filter_type, filter_slot)) {
+        if (cur->entry && cur->key && matchesFilter(cur->entry, filter_type, filter_slot))
             replyWithHotkeyEntry(c, cur);
-        }
         cur = cur->next;
     }
 }
 
-/* HOTKEYS MGRESET */
 void hotkeysMGResetCommand(client *c) {
-    if (!server.hotkey_mg_enabled) {
-        addReplyError(c, "Hotkey MG detection is disabled");
-        return;
-    }
+    if (!server.hotkey_mg_enabled) { addReplyError(c, "Hotkey MG detection is disabled"); return; }
     if (server.hotkey_mg_manager) {
-        if (server.hotkey_mg_manager->history_dict)
-            dictEmpty(server.hotkey_mg_manager->history_dict, NULL);
+        if (server.hotkey_mg_manager->history_dict) dictEmpty(server.hotkey_mg_manager->history_dict, NULL);
         if (server.hotkey_mg_manager->history_lru) {
             server.hotkey_mg_manager->history_lru->head = NULL;
             server.hotkey_mg_manager->history_lru->tail = NULL;
@@ -357,10 +315,7 @@ int hotKeyMGEnabledCallback(const char **err) {
         if (!server.hotkey_mg_manager)
             server.hotkey_mg_manager = hotkeyMGManagerInit(server.hotkey_mg_max_keys);
     } else {
-        if (server.hotkey_mg_manager) {
-            hotkeyMGManagerFree(server.hotkey_mg_manager);
-            server.hotkey_mg_manager = NULL;
-        }
+        if (server.hotkey_mg_manager) { hotkeyMGManagerFree(server.hotkey_mg_manager); server.hotkey_mg_manager = NULL; }
     }
     return 1;
 }
@@ -368,10 +323,7 @@ int hotKeyMGEnabledCallback(const char **err) {
 int hotKeyMGMaxKeysCallback(const char **err) {
     UNUSED(err);
     if (!server.hotkey_mg_enabled) return 1;
-    if (server.hotkey_mg_manager) {
-        hotkeyMGManagerFree(server.hotkey_mg_manager);
-        server.hotkey_mg_manager = NULL;
-    }
+    if (server.hotkey_mg_manager) { hotkeyMGManagerFree(server.hotkey_mg_manager); server.hotkey_mg_manager = NULL; }
     server.hotkey_mg_manager = hotkeyMGManagerInit(server.hotkey_mg_max_keys);
     return 1;
 }

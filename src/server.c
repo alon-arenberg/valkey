@@ -862,13 +862,6 @@ dictType hotkeyHistoryDictType = {
     .entryDestructor = dictEntryDestructorHotkeyLRUNode,
 };
 
-dictType hotKeyMGDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsHash,
-    .keyCompare = dictSdsKeyCompare,
-    .entryDestructor = dictEntryDestructorSdsKeyHeapValue,
-};
-
 dictType hotkeyMGHistoryDictType = {
     .entryGetKey = dictEntryGetKey,
     .hashFunction = dictSdsHash,

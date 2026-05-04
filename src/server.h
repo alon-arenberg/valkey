@@ -1791,17 +1791,19 @@ typedef struct {
     hotkeyLRU *history_lru; /* LRU linked list manager */
 } hotkeyManager;
 
-/* Misra-Gries summary entry */
+/* Misra-Gries summary entry (stored inline in flat array) */
 typedef struct {
+    sds key;         /* Key name (NULL = empty slot) */
     uint64_t count;  /* Current counter value */
     int val_type;    /* Value type (OBJ_TYPE_*) */
 } hotkeyMGEntry;
 
-/* Misra-Gries summary: at most max_keys counters */
+/* Misra-Gries summary: flat array of at most max_keys entries */
 typedef struct {
-    dict *counters;      /* sds key -> hotkeyMGEntry* */
-    long long max_keys;  /* Maximum number of tracked keys (k) */
-    uint64_t total;      /* Total observations in current window */
+    hotkeyMGEntry *entries; /* Fixed-size array of max_keys entries */
+    int max_keys;           /* Capacity (k) */
+    int size;               /* Current number of active entries */
+    uint64_t total;         /* Total observations in current window */
 } hotkeyMGSummary;
 
 /* Misra-Gries hot key manager */
@@ -2935,7 +2937,6 @@ extern dictType externalStringType;
 extern dictType sdsHashDictType;
 extern dictType hotKeyDictType;
 extern dictType hotkeyHistoryDictType;
-extern dictType hotKeyMGDictType;
 extern dictType hotkeyMGHistoryDictType;
 extern dictType heapKeysDictType;
 extern hashtableType clientHashtableType;
@@ -4364,7 +4365,6 @@ int hotKeyMGMaxKeysCallback(const char **err);
 hotkeyMGSummary *hotkeyMGSummaryNew(int max_keys);
 void hotkeyMGSummaryFree(hotkeyMGSummary *s);
 void hotkeyMGSummaryReset(hotkeyMGSummary *s);
-void hotkeyMGSummaryAdd(hotkeyMGSummary *s, robj *key);
 void hotkeyMGSummaryAddTyped(hotkeyMGSummary *s, robj *key, int val_type);
 hotkeyMGManager *hotkeyMGManagerInit(int max_keys);
 void hotkeyMGManagerFree(hotkeyMGManager *m);
