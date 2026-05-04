@@ -859,8 +859,28 @@ dictType hotkeyHistoryDictType = {
     .entryGetKey = dictEntryGetKey,
     .hashFunction = dictSdsHash,
     .keyCompare = dictSdsKeyCompare,
-    
     .entryDestructor = dictEntryDestructorHotkeyLRUNode,
+};
+
+dictType hotKeyMGDictType = {
+    .entryGetKey = dictEntryGetKey,
+    .hashFunction = dictSdsHash,
+    .keyCompare = dictSdsKeyCompare,
+    .entryDestructor = dictEntryDestructorSdsKeyHeapValue,
+};
+
+dictType hotkeyMGHistoryDictType = {
+    .entryGetKey = dictEntryGetKey,
+    .hashFunction = dictSdsHash,
+    .keyCompare = dictSdsKeyCompare,
+    .entryDestructor = dictEntryDestructorHotkeyLRUNode,
+};
+
+dictType heapKeysDictType = {
+    .entryGetKey = dictEntryGetKey,
+    .hashFunction = dictSdsHash,
+    .keyCompare = dictSdsKeyCompare,
+    .entryDestructor = dictEntryDestructorSdsKeyHeapValue,
 };
 
 size_t clientHashtableTypeMetadataSize(void) {
@@ -1717,12 +1737,19 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
         if (server.hotkey_enabled) {
             expireHotkeyHistory(server.hotkey_manager);
         }
+        if (server.hotkey_mg_enabled) {
+            expireHotkeyMGHistory(server.hotkey_mg_manager);
+        }
     }
 
     run_with_period(server.hotkey_window_seconds * 1000) {
         if (server.hotkey_enabled) {
             addHotkeyToHistory(server.hotkey_manager);
             hotkeyManagerReset(server.hotkey_manager);
+        }
+        if (server.hotkey_mg_enabled) {
+            addHotkeyMGToHistory(server.hotkey_mg_manager);
+            hotkeyMGManagerReset(server.hotkey_mg_manager);
         }
     }
 
@@ -2905,6 +2932,10 @@ void resetServerStats(void) {
     server.hotkey_runtime_read_count = 0;
     server.hotkey_runtime_write_count = 0;
     server.hotkey_runtime_history_count = 0;
+    server.hotkey_mg_runtime_total_sampled = 0;
+    server.hotkey_mg_runtime_read_count = 0;
+    server.hotkey_mg_runtime_write_count = 0;
+    server.hotkey_mg_runtime_history_count = 0;
     lazyfreeResetStats();
 }
 
@@ -3182,6 +3213,11 @@ void initServer(void) {
     /* Initialization hotkey */
     if (server.hotkey_enabled) {
         server.hotkey_manager = hotkeyManagerInit(server.hotkey_cms_bucket_size, server.hotkey_cms_depth);
+    }
+
+    /* Initialization hotkey Misra-Gries */
+    if (server.hotkey_mg_enabled) {
+        server.hotkey_mg_manager = hotkeyMGManagerInit(server.hotkey_mg_max_keys);
     }
 }
 
@@ -6832,8 +6868,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         info = sdscatprintf(info,
                             "hotkey_enabled:%d\r\n"
                             "hotkey_sampling_ratio:%d\r\n"
-                            "hotkey_read_threshold:%d\r\n"
-                            "hotkey_write_threshold:%d\r\n"
+                            "hotkey_top_k:%d\r\n"
                             "hotkey_window_seconds:%d\r\n"
                             "hotkey_cms_bucket_size:%d\r\n"
                             "hotkey_cms_depth:%d\r\n"
@@ -6845,8 +6880,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                             "hotkey_runtime_history_count:%u\r\n",
                             server.hotkey_enabled,
                             server.hotkey_sampling_ratio,
-                            server.hotkey_read_threshold,
-                            server.hotkey_write_threshold,
+                            server.hotkey_top_k,
                             server.hotkey_window_seconds,
                             server.hotkey_cms_bucket_size,
                             server.hotkey_cms_depth,
@@ -6856,6 +6890,31 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                             server.hotkey_runtime_read_count,
                             server.hotkey_runtime_write_count,
                             server.hotkey_runtime_history_count);
+    }
+
+    /* Hotkey Misra-Gries */
+    if (all_sections || (dictFind(section_dict, "hotkeymg") != NULL)) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = sdscatprintf(info, "# HotkeyMG\r\n");
+        info = sdscatprintf(info,
+                            "hotkey_mg_enabled:%d\r\n"
+                            "hotkey_mg_max_keys:%d\r\n"
+                            "hotkey_mg_sampling_ratio:%d\r\n"
+                            "hotkey_mg_history_max_count:%d\r\n"
+                            "hotkey_mg_history_ttl:%d\r\n"
+                            "hotkey_mg_runtime_total_sampled:%llu\r\n"
+                            "hotkey_mg_runtime_read_count:%llu\r\n"
+                            "hotkey_mg_runtime_write_count:%llu\r\n"
+                            "hotkey_mg_runtime_history_count:%u\r\n",
+                            server.hotkey_mg_enabled,
+                            server.hotkey_mg_max_keys,
+                            server.hotkey_mg_sampling_ratio,
+                            server.hotkey_mg_history_max_count,
+                            server.hotkey_mg_history_ttl,
+                            server.hotkey_mg_runtime_total_sampled,
+                            server.hotkey_mg_runtime_read_count,
+                            server.hotkey_mg_runtime_write_count,
+                            server.hotkey_mg_runtime_history_count);
     }
 
     /* Get info from modules.

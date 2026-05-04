@@ -123,12 +123,24 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
 
     /* If the hot key detection function is enabled and the hot key sampling rate is reached,
      * hot key statistics will be performed. */
+    int hotkey_slot = -1; /* Computed lazily if needed; 0 when cluster disabled */
     if (server.hotkey_enabled && (rand() % 100) < server.hotkey_sampling_ratio) {
         int obj_type = val ? val->type : OBJ_STRING;
+        if (hotkey_slot < 0) hotkey_slot = server.cluster_enabled ? keyHashSlot(objectGetVal(key), stringObjectLen(key)) : 0;
         if (flags & LOOKUP_WRITE) {
-            writeHotKeyDetection(key, obj_type);
+            writeHotKeyDetection(key, obj_type, hotkey_slot);
         } else {
-            readHotKeyDetection(key, obj_type);
+            readHotKeyDetection(key, obj_type, hotkey_slot);
+        }
+    }
+
+    if (server.hotkey_mg_enabled && (rand() % 100) < server.hotkey_mg_sampling_ratio) {
+        int obj_type = val ? val->type : OBJ_STRING;
+        if (hotkey_slot < 0) hotkey_slot = server.cluster_enabled ? keyHashSlot(objectGetVal(key), stringObjectLen(key)) : 0;
+        if (flags & LOOKUP_WRITE) {
+            writeHotKeyMGDetection(key, obj_type, hotkey_slot);
+        } else {
+            readHotKeyMGDetection(key, obj_type, hotkey_slot);
         }
     }
 

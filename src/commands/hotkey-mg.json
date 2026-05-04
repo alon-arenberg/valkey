@@ -1,11 +1,11 @@
 {
-    "GET": {
-        "summary": "Get hot keys from history",
+    "MG": {
+        "summary": "Get hot keys detected by Misra-Gries algorithm from history",
         "complexity": "O(N) where N is the number of hot keys in the history",
         "group": "server",
         "since": "9.0.0",
         "arity": -2,
-        "function": "hotkeysGetCommand",
+        "function": "hotkeysMGGetCommand",
         "command_flags": [
             "ADMIN",
             "LOADING",

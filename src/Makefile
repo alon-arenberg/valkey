@@ -509,6 +509,7 @@ ENGINE_SERVER_OBJ = \
     geohash_helper.o \
     hashtable.o \
 	hotkey.o \
+	hotkeymg.o \
     hyperloglog.o \
     intset.o \
     io_threads.o \
