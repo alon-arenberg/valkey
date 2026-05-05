@@ -1803,6 +1803,10 @@ int parseOptions(int argc, char **argv) {
             config.datasize = atoi(argv[++i]);
             if (config.datasize < 1) config.datasize = 1;
             if (config.datasize > 1024 * 1024 * 1024) config.datasize = 1024 * 1024 * 1024;
+        } else if (!strcmp(argv[i], "--key-size")) {
+            if (lastarg) goto invalid;
+            config.keysize = atoi(argv[++i]);
+            if (config.keysize < 1) config.keysize = 1;
         } else if (!strcmp(argv[i], "-P")) {
             if (lastarg) goto invalid;
             config.pipeline = atoi(argv[++i]);
@@ -2048,6 +2052,8 @@ usage:
         " --warmup <seconds> Run benchmark for specified warmup period before\n"
         "                    recording data\n"
         " -d <size>          Data size of SET/GET value in bytes (default 3)\n"
+        " --key-size <size>  Key size in bytes for default tests. Keys are padded to\n"
+        "                    reach the specified size. (default: no padding)\n"
         " --dbnum <db>       SELECT the specified db number (default 0)\n"
         " -3                 Start session in RESP3 protocol mode.\n"
         " --threads <num>    Enable multi-thread mode.\n"
@@ -2295,6 +2301,7 @@ int main(int argc, char **argv) {
     aeCreateTimeEvent(config.el, 1, showThroughput, NULL, NULL);
     config.keepalive = 1;
     config.datasize = 3;
+    config.keysize = 0;
     config.pipeline = 1;
     config.replace_placeholders = 0;
     config.keyspacelen = 0;
@@ -2582,6 +2589,23 @@ int main(int argc, char **argv) {
 
     /* Run default benchmark suite. */
     data = zmalloc(config.datasize + 1);
+
+    /* Generate key padding prefix if --key-size is specified.
+     * Built-in test keys have the form: {keypad}key{tag}:__rand_int__
+     * where __rand_int__ is 12 chars and tag is "" or ":{tag}" (5 chars).
+     * The padding ensures total key length matches config.keysize. */
+    sds keypad = sdsempty();
+    if (config.keysize > 0) {
+        /* Base key length without padding: "key" + tag + ":" + 12 */
+        int base_len = 3 + (int)strlen(tag) + 1 + PLACEHOLDER_LEN;
+        int pad_len = config.keysize - base_len;
+        if (pad_len > 0) {
+            keypad = sdsgrowzero(keypad, pad_len);
+            memset(keypad, 'k', pad_len);
+            sdsIncrLen(keypad, 0); /* length already set by sdsgrowzero */
+        }
+    }
+
     do {
         genBenchmarkRandomData(data, config.datasize);
         data[config.datasize] = '\0';
@@ -2595,19 +2619,19 @@ int main(int argc, char **argv) {
         }
 
         if (test_is_selected("set")) {
-            len = valkeyFormatCommand(&cmd, "SET key%s:__rand_int__ %s", tag, data);
+            len = valkeyFormatCommand(&cmd, "SET %skey%s:__rand_int__ %s", keypad, tag, data);
             benchmark("SET", cmd, len);
             free(cmd);
         }
 
         if (test_is_selected("get")) {
-            len = valkeyFormatCommand(&cmd, "GET key%s:__rand_int__", tag);
+            len = valkeyFormatCommand(&cmd, "GET %skey%s:__rand_int__", keypad, tag);
             benchmark("GET", cmd, len);
             free(cmd);
         }
 
         if (test_is_selected("incr")) {
-            len = valkeyFormatCommand(&cmd, "INCR counter%s:__rand_int__", tag);
+            len = valkeyFormatCommand(&cmd, "INCR %scounter%s:__rand_int__", keypad, tag);
             benchmark("INCR", cmd, len);
             free(cmd);
         }
@@ -2702,7 +2726,7 @@ int main(int argc, char **argv) {
         if (test_is_selected("mset")) {
             const char *cmd_argv[21];
             cmd_argv[0] = "MSET";
-            sds key_placeholder = sdscatprintf(sdsnew(""), "key%s:__rand_int__", tag);
+            sds key_placeholder = sdscatprintf(sdsnew(""), "%skey%s:__rand_int__", keypad, tag);
             for (i = 1; i < 21; i += 2) {
                 cmd_argv[i] = key_placeholder;
                 cmd_argv[i + 1] = data;
@@ -2716,7 +2740,7 @@ int main(int argc, char **argv) {
         if (test_is_selected("mget")) {
             const char *cmd_argv[11];
             cmd_argv[0] = "MGET";
-            sds key_placeholder = sdscatprintf(sdsnew(""), "key%s:__rand_int__", tag);
+            sds key_placeholder = sdscatprintf(sdsnew(""), "%skey%s:__rand_int__", keypad, tag);
             for (i = 1; i < 11; i++) {
                 cmd_argv[i] = key_placeholder;
             }
@@ -2781,6 +2805,7 @@ int main(int argc, char **argv) {
     } while (config.loop);
 
     zfree(data);
+    sdsfree(keypad);
     freeCliConnInfo(config.conn_info);
     if (config.server_config != NULL) freeServerConfig(config.server_config);
     resetPlaceholders();
