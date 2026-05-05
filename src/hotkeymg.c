@@ -327,3 +327,41 @@ int hotKeyMGMaxKeysCallback(const char **err) {
     server.hotkey_mg_manager = hotkeyMGManagerInit(server.hotkey_mg_max_keys);
     return 1;
 }
+
+/* ---- Slot purge ---- */
+
+void hotkeyMGPurgeSlot(int slot) {
+    hotkeyMGManager *m = server.hotkey_mg_manager;
+    if (!m) return;
+    if (m->read_summaries[slot]) { hotkeyMGSummaryFree(m->read_summaries[slot]); m->read_summaries[slot] = NULL; }
+    if (m->write_summaries[slot]) { hotkeyMGSummaryFree(m->write_summaries[slot]); m->write_summaries[slot] = NULL; }
+    /* Remove history entries for this slot */
+    if (m->history_lru && m->history_dict) {
+        hotkeyLRUNode *cur = m->history_lru->head;
+        while (cur) {
+            hotkeyLRUNode *next = cur->next;
+            if (cur->entry && cur->entry->slot == slot) {
+                if (cur->prev) cur->prev->next = cur->next;
+                else m->history_lru->head = cur->next;
+                if (cur->next) cur->next->prev = cur->prev;
+                else m->history_lru->tail = cur->prev;
+                m->history_lru->size--;
+                if (cur->key) dictDelete(m->history_dict, cur->key);
+            }
+            cur = next;
+        }
+    }
+    server.hotkey_mg_runtime_history_count = m->history_lru ? m->history_lru->size : 0;
+}
+
+void hotkeyMGPurgeAll(void) {
+    hotkeyMGManager *m = server.hotkey_mg_manager;
+    if (!m) return;
+    for (int i = 0; i < HOTKEY_SLOTS; i++) {
+        if (m->read_summaries[i]) { hotkeyMGSummaryFree(m->read_summaries[i]); m->read_summaries[i] = NULL; }
+        if (m->write_summaries[i]) { hotkeyMGSummaryFree(m->write_summaries[i]); m->write_summaries[i] = NULL; }
+    }
+    if (m->history_dict) dictEmpty(m->history_dict, NULL);
+    if (m->history_lru) { m->history_lru->head = NULL; m->history_lru->tail = NULL; m->history_lru->size = 0; }
+    server.hotkey_mg_runtime_history_count = 0;
+}

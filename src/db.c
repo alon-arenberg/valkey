@@ -704,6 +704,9 @@ long long emptyData(int dbnum, int flags, void(callback)(hashtable *)) {
     /* Empty the database structure. */
     removed = emptyDbStructure(server.db, dbnum, async, callback);
 
+    /* Purge all hot key detection state since keys are gone. */
+    hotkeyPurgeAll();
+
     if (dbnum == -1) flushReplicaKeysWithExpireList(async);
 
     if (with_functions) {

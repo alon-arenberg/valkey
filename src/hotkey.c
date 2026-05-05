@@ -92,6 +92,25 @@ void hotkeysResetCommand(client *c) {
     addReply(c, shared.ok);
 }
 
+/* HOTKEYS PURGE SLOT <n> */
+void hotkeysPurgeCommand(client *c) {
+    if (!server.hotkey_enabled && !server.hotkey_mg_enabled) {
+        addReplyError(c, "Hotkey detection is disabled");
+        return;
+    }
+    if (c->argc != 4 || strcasecmp(objectGetVal(c->argv[2]), "SLOT")) {
+        addReplyError(c, "Syntax error. Usage: HOTKEYS PURGE SLOT <slot>");
+        return;
+    }
+    long long slot;
+    if (getLongLongFromObject(c->argv[3], &slot) != C_OK || slot < 0 || slot >= HOTKEY_SLOTS) {
+        addReplyErrorFormat(c, "Invalid slot number. Must be 0-%d", HOTKEY_SLOTS - 1);
+        return;
+    }
+    hotkeyPurgeSlot((int)slot);
+    addReply(c, shared.ok);
+}
+
 void hotkeysCommand(client *c) {
     if (c->argc < 2) { addReplyError(c, "Wrong number of arguments for 'HOTKEYS' command"); return; }
     char *subcmd = objectGetVal(c->argv[1]);
@@ -99,6 +118,7 @@ void hotkeysCommand(client *c) {
     else if (!strcasecmp(subcmd, "reset")) hotkeysResetCommand(c);
     else if (!strcasecmp(subcmd, "mg")) hotkeysMGGetCommand(c);
     else if (!strcasecmp(subcmd, "mgreset")) hotkeysMGResetCommand(c);
+    else if (!strcasecmp(subcmd, "purge")) hotkeysPurgeCommand(c);
     else addReplyErrorFormat(c, "Unknown HOTKEYS subcommand '%s'", subcmd);
 }
 
@@ -512,4 +532,56 @@ int hotKeyCMSDepthCallback(const char **err) {
     if (server.hotkey_manager) { hotkeyManagerFree(server.hotkey_manager); server.hotkey_manager = NULL; }
     server.hotkey_manager = hotkeyManagerInit(server.hotkey_cms_bucket_size, server.hotkey_cms_depth);
     return 1;
+}
+
+/* ---- Slot purge ---- */
+
+/* Remove all history entries matching a given slot from an LRU+dict history. */
+static void purgeHistoryBySlot(hotkeyLRU *lru, dict *history_dict, int slot) {
+    if (!lru || !history_dict) return;
+    hotkeyLRUNode *cur = lru->head;
+    while (cur) {
+        hotkeyLRUNode *next = cur->next;
+        if (cur->entry && cur->entry->slot == slot) {
+            if (cur->prev) cur->prev->next = cur->next;
+            else lru->head = cur->next;
+            if (cur->next) cur->next->prev = cur->prev;
+            else lru->tail = cur->prev;
+            lru->size--;
+            if (cur->key) dictDelete(history_dict, cur->key);
+        }
+        cur = next;
+    }
+}
+
+/* Purge CMS per-slot structures and history entries for a single slot. */
+void hotkeyPurgeSlot(int slot) {
+    hotkeyManager *m = server.hotkey_manager;
+    if (!m) return;
+    if (m->read_cms[slot]) { freeHotkeyCMS(m->read_cms[slot]); m->read_cms[slot] = NULL; }
+    if (m->read_topk[slot]) { hotkeyHeapFree(m->read_topk[slot]); m->read_topk[slot] = NULL; }
+    if (m->write_cms[slot]) { freeHotkeyCMS(m->write_cms[slot]); m->write_cms[slot] = NULL; }
+    if (m->write_topk[slot]) { hotkeyHeapFree(m->write_topk[slot]); m->write_topk[slot] = NULL; }
+    purgeHistoryBySlot(m->history_lru, m->history_dict, slot);
+    server.hotkey_runtime_history_count = m->history_lru->size;
+
+    /* Also purge MG for this slot */
+    hotkeyMGPurgeSlot(slot);
+}
+
+/* Purge all CMS per-slot structures and all history. */
+void hotkeyPurgeAll(void) {
+    hotkeyManager *m = server.hotkey_manager;
+    if (m) {
+        for (int i = 0; i < HOTKEY_SLOTS; i++) {
+            if (m->read_cms[i]) { freeHotkeyCMS(m->read_cms[i]); m->read_cms[i] = NULL; }
+            if (m->read_topk[i]) { hotkeyHeapFree(m->read_topk[i]); m->read_topk[i] = NULL; }
+            if (m->write_cms[i]) { freeHotkeyCMS(m->write_cms[i]); m->write_cms[i] = NULL; }
+            if (m->write_topk[i]) { hotkeyHeapFree(m->write_topk[i]); m->write_topk[i] = NULL; }
+        }
+        if (m->history_dict) dictEmpty(m->history_dict, NULL);
+        if (m->history_lru) { m->history_lru->head = NULL; m->history_lru->tail = NULL; m->history_lru->size = 0; }
+        server.hotkey_runtime_history_count = 0;
+    }
+    hotkeyMGPurgeAll();
 }

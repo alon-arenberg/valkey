@@ -4335,6 +4335,7 @@ void failoverCommand(client *c);
 void hotkeysCommand(client *c);
 void hotkeysGetCommand(client *c);
 void hotkeysResetCommand(client *c);
+void hotkeysPurgeCommand(client *c);
 
 /* Hotkey */
 int hotKeyEnabledCallback(const char **err);
@@ -4356,6 +4357,8 @@ void addHotkeyToHistory(hotkeyManager *manager);
 void expireHotkeyHistory(hotkeyManager *manager);
 void writeHotKeyDetection(robj *key, int val_type, int slot);
 void readHotKeyDetection(robj *key, int val_type, int slot);
+void hotkeyPurgeSlot(int slot);
+void hotkeyPurgeAll(void);
 
 /* Hotkey Misra-Gries */
 void hotkeysMGGetCommand(client *c);
@@ -4373,6 +4376,8 @@ void readHotKeyMGDetection(robj *key, int val_type, int slot);
 void writeHotKeyMGDetection(robj *key, int val_type, int slot);
 void addHotkeyMGToHistory(hotkeyMGManager *m);
 void expireHotkeyMGHistory(hotkeyMGManager *m);
+void hotkeyMGPurgeSlot(int slot);
+void hotkeyMGPurgeAll(void);
 
 /* Helper functions for getting database id args from argv, argc */
 int *selectDbIdArgs(robj **argv, int argc, int *count);
