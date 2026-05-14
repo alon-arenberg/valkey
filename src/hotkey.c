@@ -43,7 +43,7 @@ static int parseHotkeyFilterArgs(client *c, int start_idx, int *filter_type, int
             if (getLongLongFromObject(c->argv[i + 1], &slot) != C_OK ||
                 slot < 0 || slot >= HOTKEY_SLOTS) {
                 addReplyErrorFormat(c, "Invalid slot number. Must be 0-%d",
-                                   HOTKEY_SLOTS - 1);
+                                    HOTKEY_SLOTS - 1);
                 return 0;
             }
             *filter_slot = (int)slot;
@@ -64,11 +64,13 @@ static int matchesFilter(hotkeyHistoryEntry *e, int filter_type, int filter_slot
     return 1;
 }
 
-/* Format and send a single hotkey history entry to the client. */
+/* Format and send a single hotkey history entry to the client.
+ * node->key has a 1-byte type prefix (\x00=read, \x01=write) used for
+ * dict keying; skip it when replying to the client. */
 static void replyWithHotkeyEntry(client *c, hotkeyLRUNode *node) {
     addReplyArrayLen(c, 14);
     addReplyBulkCString(c, "key");
-    addReplyBulkCString(c, node->key);
+    addReplyBulkCBuffer(c, node->key + 1, sdslen(node->key) - 1);
     addReplyBulkCString(c, "type");
     addReplyBulkCString(c, node->entry->is_read ? "read" : "write");
     addReplyBulkCString(c, "slot");
@@ -312,23 +314,29 @@ static uint64_t calculateQPS(uint64_t count) {
 /* Upsert a single key into the global history. If the key already exists,
  * update its peak QPS and timestamps; otherwise create a new entry (possibly
  * evicting the oldest one). */
-static void addSingleToHistory(hotkeyManager *m, const char *key_str,
-                               uint64_t count, int val_type,
-                               int is_read, int slot) {
+static void addSingleToHistory(hotkeyManager *m, sds key_str, uint64_t count, int val_type, int is_read, int slot) {
     time_t now;
     uint64_t qps;
     dictEntry *de;
     hotkeyHistoryEntry *h;
     hotkeyLRUNode *node;
     sds ks;
+    char prefix;
 
     if (!m || !key_str) return;
     now = time(NULL);
     qps = calculateQPS(count);
 
+    /* Build composite lookup key: 1-byte type prefix + original key.
+     * This ensures read and write entries for the same key are distinct. */
+    prefix = is_read ? '\x00' : '\x01';
+    ks = sdsnewlen(&prefix, 1);
+    ks = sdscatsds(ks, key_str);
+
     /* If key already in history, update and move to head. */
-    de = dictFind(m->history_dict, key_str);
+    de = dictFind(m->history_dict, ks);
     if (de) {
+        sdsfree(ks);
         node = dictGetVal(de);
         if (!node || !node->entry) return;
         h = node->entry;
@@ -358,7 +366,6 @@ static void addSingleToHistory(hotkeyManager *m, const char *key_str,
     h->val_type = val_type;
     h->slot = slot;
 
-    ks = sdsnew(key_str);
     node = hotkeyLRUAddToHead(m->history_lru, ks, h);
     if (dictAdd(m->history_dict, ks, node) != DICT_OK) {
         /* Dict add failed — undo the LRU insertion. */
@@ -518,7 +525,7 @@ void hotkeysPurgeCommand(client *c) {
     if (getLongLongFromObject(c->argv[3], &slot) != C_OK ||
         slot < 0 || slot >= HOTKEY_SLOTS) {
         addReplyErrorFormat(c, "Invalid slot number. Must be 0-%d",
-                           HOTKEY_SLOTS - 1);
+                            HOTKEY_SLOTS - 1);
         return;
     }
     hotkeyPurgeSlot((int)slot);
@@ -557,6 +564,7 @@ int hotKeyEnabledCallback(const char **err) {
         if (server.hotkey_manager) {
             hotkeyManagerFree(server.hotkey_manager);
             server.hotkey_manager = NULL;
+            server.hotkey_runtime_history_count = 0;
         }
     }
     return 1;
@@ -568,6 +576,7 @@ int hotKeyMaxKeysCallback(const char **err) {
     if (server.hotkey_manager) {
         hotkeyManagerFree(server.hotkey_manager);
         server.hotkey_manager = NULL;
+        server.hotkey_runtime_history_count = 0;
     }
     server.hotkey_manager = hotkeyManagerInit(server.hotkey_max_keys);
     return 1;

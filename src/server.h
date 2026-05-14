@@ -1756,9 +1756,9 @@ typedef struct {
 
 /* Misra-Gries summary entry (stored inline in flat array) */
 typedef struct {
-    sds key;         /* Key name (NULL = empty slot) */
-    uint64_t count;  /* Current counter value */
-    int val_type;    /* Value type (OBJ_TYPE_*) */
+    sds key;        /* Key name (NULL = empty slot) */
+    uint64_t count; /* Current counter value */
+    int val_type;   /* Value type (OBJ_TYPE_*) */
 } hotkeyMGEntry;
 
 /* Misra-Gries summary: flat array of at most max_keys entries */
@@ -1771,10 +1771,10 @@ typedef struct {
 
 /* Hotkey manager: per-slot Misra-Gries summaries + global history */
 typedef struct {
-    hotkeyMGSummary *read_summaries[HOTKEY_SLOTS];   /* Per-slot, lazily allocated */
-    hotkeyMGSummary *write_summaries[HOTKEY_SLOTS];  /* Per-slot, lazily allocated */
-    dict *history_dict;     /* sds key -> hotkeyLRUNode* */
-    hotkeyLRU *history_lru; /* LRU list for history */
+    hotkeyMGSummary *read_summaries[HOTKEY_SLOTS];  /* Per-slot, lazily allocated */
+    hotkeyMGSummary *write_summaries[HOTKEY_SLOTS]; /* Per-slot, lazily allocated */
+    dict *history_dict;                             /* sds key -> hotkeyLRUNode* */
+    hotkeyLRU *history_lru;                         /* LRU list for history */
 } hotkeyManager;
 
 /*-----------------------------------------------------------------------------

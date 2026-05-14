@@ -27,11 +27,14 @@ start_server {tags {"hotkey"}} {
             r set "hot_write_key" "value_$j"
         }
 
-        after 2000
+        wait_for_condition 50 100 {
+            [llength [r hotkeys get]] > 0
+        } else {
+            fail "No hot keys detected after repeated access"
+        }
 
         set all_hotkeys [r hotkeys get]
         puts "All hotkeys detected: [llength $all_hotkeys]"
-        assert {[llength $all_hotkeys] > 0}
 
         # Verify 14-field reply (includes slot)
         set first [lindex $all_hotkeys 0]
@@ -39,33 +42,111 @@ start_server {tags {"hotkey"}} {
     }
 
     test "HOTKEYS GET with TYPE filter" {
+        r hotkeys reset
+        r config set hotkey-sampling-ratio 100
+        r config set hotkey-max-keys 16
+        r config set hotkey-window-seconds 1
+
+        r set "type_filter_key" "val"
+        for {set i 0} {$i < 500} {incr i} {
+            r get "type_filter_key"
+            r set "type_filter_key" "val_$i"
+        }
+
+        wait_for_condition 50 100 {
+            [llength [r hotkeys get]] >= 2
+        } else {
+            fail "Expected at least 2 hotkeys (read + write)"
+        }
+
         set read_hotkeys [r hotkeys get TYPE read]
         set write_hotkeys [r hotkeys get TYPE write]
         set all_hotkeys [r hotkeys get TYPE all]
-        puts "Read: [llength $read_hotkeys], Write: [llength $write_hotkeys], All: [llength $all_hotkeys]"
-        assert {[llength $all_hotkeys] >= 0}
+
+        assert {[llength $read_hotkeys] > 0}
+        assert {[llength $write_hotkeys] > 0}
+        assert_equal [llength $all_hotkeys] [expr {[llength $read_hotkeys] + [llength $write_hotkeys]}]
+
+        # Verify every entry returned by TYPE read is actually a read
+        foreach entry $read_hotkeys {
+            assert_equal [lindex $entry 3] "read" "TYPE read filter returned non-read entry"
+        }
+        # Verify every entry returned by TYPE write is actually a write
+        foreach entry $write_hotkeys {
+            assert_equal [lindex $entry 3] "write" "TYPE write filter returned non-write entry"
+        }
     }
 
     test "HOTKEYS GET with SLOT filter" {
+        r hotkeys reset
+        r config set hotkey-sampling-ratio 100
+        r config set hotkey-max-keys 16
+        r config set hotkey-window-seconds 1
+
+        for {set i 0} {$i < 500} {incr i} { r get "slot_filter_key" }
+
+        wait_for_condition 50 100 {
+            [llength [r hotkeys get]] > 0
+        } else {
+            fail "No hotkeys detected for slot filter test"
+        }
+
         set all_hotkeys [r hotkeys get]
-        assert {[llength $all_hotkeys] > 0}
         set first [lindex $all_hotkeys 0]
         set slot_val [lindex $first 5]
+
+        # Filter by the detected slot — should return same entries
         set slot_hotkeys [r hotkeys get SLOT $slot_val]
         assert {[llength $slot_hotkeys] > 0}
+        foreach entry $slot_hotkeys {
+            assert_equal [lindex $entry 5] $slot_val "SLOT filter returned entry from wrong slot"
+        }
+
+        # Filter by a different slot — should return nothing
+        set other_slot [expr {($slot_val + 1) % 16384}]
+        set other_hotkeys [r hotkeys get SLOT $other_slot]
+        assert_equal [llength $other_hotkeys] 0 "SLOT filter for inactive slot should return empty"
     }
 
     test "HOTKEYS GET with SLOT and TYPE combined" {
-        set all_hotkeys [r hotkeys get]
-        if {[llength $all_hotkeys] > 0} {
-            set first [lindex $all_hotkeys 0]
-            set slot_val [lindex $first 5]
-            set type_val [lindex $first 3]
-            set filtered [r hotkeys get SLOT $slot_val TYPE $type_val]
-            assert {[llength $filtered] > 0}
-            set filtered2 [r hotkeys get TYPE $type_val SLOT $slot_val]
-            assert {[llength $filtered2] > 0}
+        r hotkeys reset
+        r config set hotkey-sampling-ratio 100
+        r config set hotkey-max-keys 16
+        r config set hotkey-window-seconds 1
+
+        r set "combined_filter_key" "val"
+        for {set i 0} {$i < 500} {incr i} {
+            r get "combined_filter_key"
+            r set "combined_filter_key" "val_$i"
         }
+
+        wait_for_condition 50 100 {
+            [llength [r hotkeys get]] >= 2
+        } else {
+            fail "Expected at least 2 hotkeys for combined filter test"
+        }
+
+        set all_hotkeys [r hotkeys get]
+        set first [lindex $all_hotkeys 0]
+        set slot_val [lindex $first 5]
+
+        # SLOT + TYPE read
+        set filtered [r hotkeys get SLOT $slot_val TYPE read]
+        foreach entry $filtered {
+            assert_equal [lindex $entry 3] "read" "Combined filter returned non-read entry"
+            assert_equal [lindex $entry 5] $slot_val "Combined filter returned wrong slot"
+        }
+
+        # TYPE write + SLOT (reversed order)
+        set filtered2 [r hotkeys get TYPE write SLOT $slot_val]
+        foreach entry $filtered2 {
+            assert_equal [lindex $entry 3] "write" "Combined filter returned non-write entry"
+            assert_equal [lindex $entry 5] $slot_val "Combined filter returned wrong slot"
+        }
+
+        # Total from split filters should equal unfiltered for this slot
+        set slot_all [r hotkeys get SLOT $slot_val]
+        assert_equal [llength $slot_all] [expr {[llength $filtered] + [llength $filtered2]}]
     }
 
     test "HOTKEYS RESET clears all statistics" {
@@ -80,6 +161,13 @@ start_server {tags {"hotkey"}} {
         r config set hotkey-sampling-ratio 100
         r config set hotkey-max-keys 16
 
+        # Seed each key so it exists with the correct type
+        r set "hot_string" "value"
+        r hset "hot_hash" "field_1" "value"
+        r rpush "hot_list" "item"
+        r sadd "hot_set" "member"
+        r zadd "hot_zset" 1.0 "member"
+
         for {set i 1} {$i <= 1000} {incr i} {
             r get "hot_string"
             r hget "hot_hash" "field_1"
@@ -88,11 +176,14 @@ start_server {tags {"hotkey"}} {
             r zrange "hot_zset" 0 -1
         }
 
-        after 1100
+        wait_for_condition 50 100 {
+            [llength [r hotkeys get]] > 0
+        } else {
+            fail "No hot keys detected for different data types"
+        }
 
         set all_hotkeys [r hotkeys get]
         puts "Hotkeys detected for different data types: [llength $all_hotkeys]"
-        assert {[llength $all_hotkeys] > 0}
     }
 
     test "Invalid HOTKEYS command syntax" {
@@ -150,7 +241,11 @@ start_server {tags {"hotkey"}} {
             r get "super_hot_read"
         }
 
-        after 1100
+        wait_for_condition 50 100 {
+            [llength [r hotkeys get]] > 0
+        } else {
+            fail "No hot keys detected with high frequency access"
+        }
 
         set all_hotkeys [r hotkeys get]
         set read_hotkeys [r hotkeys get TYPE read]
@@ -176,11 +271,15 @@ start_server {tags {"hotkey"}} {
             }
         }
 
-        after 1100
+        wait_for_condition 50 100 {
+            [llength [r hotkeys get]] > 0
+        } else {
+            fail "No hot keys detected for LRU test"
+        }
 
         set all_hotkeys [r hotkeys get]
         puts "LRU test - hotkeys count: [llength $all_hotkeys]"
-        assert {[llength $all_hotkeys] <= 5}
+        assert_equal [llength $all_hotkeys] 5
     }
 
     test "Test history expiration functionality" {
@@ -196,14 +295,20 @@ start_server {tags {"hotkey"}} {
             r get "expire_test_key"
         }
 
-        after 1100
+        wait_for_condition 50 100 {
+            [llength [r hotkeys get]] > 0
+        } else {
+            fail "No hot keys detected before expiration test"
+        }
+
         set hotkeys_before [r hotkeys get]
         puts "Before expiration: [llength $hotkeys_before] hotkeys"
 
-        after 3000
-        set hotkeys_after [r hotkeys get]
-        puts "After expiration: [llength $hotkeys_after] hotkeys"
-        assert_equal [llength $hotkeys_after] 0
+        wait_for_condition 50 200 {
+            [llength [r hotkeys get]] == 0
+        } else {
+            fail "Hot keys did not expire after TTL"
+        }
     }
 
     test "Test memory cleanup on manager recreation" {
@@ -218,7 +323,12 @@ start_server {tags {"hotkey"}} {
                 r get "memory_test_key_$i"
             }
         }
-        after 1100
+
+        wait_for_condition 50 100 {
+            [llength [r hotkeys get]] > 0
+        } else {
+            fail "No hot keys detected before manager recreation"
+        }
 
         r config set hotkey-enabled no
         r config set hotkey-enabled yes
@@ -245,7 +355,11 @@ start_server {tags {"hotkey"}} {
         for {set i 1} {$i <= 600} {incr i} { r get "metrics_test_read_key" }
         for {set i 1} {$i <= 400} {incr i} { r set "metrics_test_write_key" "value_$i" }
 
-        after 1100
+        wait_for_condition 50 100 {
+            [llength [r hotkeys get]] > 0
+        } else {
+            fail "No hot keys detected for metrics test"
+        }
 
         set info_after [r info hotkey]
         set final_total_sampled 0
@@ -287,10 +401,14 @@ start_server {tags {"hotkey"}} {
         r config set hotkey-window-seconds 1
 
         for {set i 0} {$i < 600} {incr i} { r get "slot_test_key" }
-        after 1100
+
+        wait_for_condition 50 100 {
+            [llength [r hotkeys get]] > 0
+        } else {
+            fail "No hot keys detected for slot test"
+        }
 
         set hotkeys [r hotkeys get]
-        assert {[llength $hotkeys] > 0}
         set first [lindex $hotkeys 0]
         assert_equal [llength $first] 14
         assert_equal [lindex $first 4] "slot"
@@ -312,12 +430,14 @@ start_server {tags {"hotkey"}} {
         for {set i 0} {$i < 500} {incr i} { r get "warm_key" }
         for {set i 0} {$i < 1000} {incr i} { r get "hot_key" }
 
-        after 1100
+        wait_for_condition 50 100 {
+            [llength [r hotkeys get]] > 0
+        } else {
+            fail "No hot keys detected for max-keys test"
+        }
 
         set hotkeys [r hotkeys get]
         puts "Max-keys test: [llength $hotkeys] hotkeys detected"
-        # With max-keys=3, we should see at most 3 keys per type
-        assert {[llength $hotkeys] > 0}
-        assert {[llength $hotkeys] <= 3}
+        assert_equal [llength $hotkeys] 3
     }
 }
