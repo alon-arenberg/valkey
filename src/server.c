@@ -834,38 +834,7 @@ dictType sdsHashDictType = {
     .entryDestructor = dictEntryDestructorSdsKeyHeapValue,
 };
 
-void dictHotkeyLRUNodeDestructor(void *val) {
-    hotkeyLRUNode *node = (hotkeyLRUNode *)val;
-    if (node) {
-        if (node->key) {
-            sdsfree(node->key);
-        }
-        if (node->entry) {
-            zfree(node->entry);
-        }
-        zfree(node);
-    }
-}
 
-/* Dict for case-sensitive search using sds objects with a zmalloc
- * allocated object as the value. */
-dictType hotKeyDictType = {
-    dictSdsHash,       /* hash function */
-    NULL,              /* key dup */
-    dictSdsKeyCompare, /* key compare */
-    dictSdsDestructor, /* key destructor */
-    dictVanillaFree,   /* val destructor */
-    NULL               /* allow to expand */
-};
-
-dictType hotkeyHistoryDictType = {
-    dictSdsHash,                 /* hash function */
-    NULL,                        /* key dup */
-    dictSdsKeyCompare,           /* key compare */
-    NULL,                        /* key destructor - key is owned by LRU node */
-    dictHotkeyLRUNodeDestructor, /* val destructor */
-    NULL                         /* allow to expand */
-};
 
 size_t clientHashtableTypeMetadataSize(void) {
     return sizeof(void *);
@@ -1717,18 +1686,6 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
         }
     }
 
-    run_with_period(server.hotkey_history_ttl * 100) {
-        if (server.hotkey_enabled) {
-            expireHotkeyHistory(server.hotkey_manager);
-        }
-    }
-
-    run_with_period(server.hotkey_window_seconds * 1000) {
-        if (server.hotkey_enabled) {
-            addHotkeyToHistory(server.hotkey_manager);
-            hotkeyManagerReset(server.hotkey_manager);
-        }
-    }
 
     /* Clear the paused actions state if needed. */
     updatePausedActions();
@@ -2307,8 +2264,6 @@ void createSharedObjects(void) {
     shared.failed = createSharedString("FAILED");
     shared.name = createSharedString("NAME");
     shared.message = createSharedString("MESSAGE");
-    /* Hotkey notification channel */
-    shared.hotkey_notify_channel = createStringObject("__hotkey_notify__", 17);
 
     for (j = 0; j < OBJ_SHARED_INTEGERS; j++) {
         shared.integers[j] = makeObjectShared(createObject(OBJ_STRING, (void *)(long)j));
@@ -2906,9 +2861,6 @@ void resetServerStats(void) {
     server.stat_active_time = 0;
     server.el_iteration_active = false;
     server.hotkey_runtime_total_sampled = 0;
-    server.hotkey_runtime_read_count = 0;
-    server.hotkey_runtime_write_count = 0;
-    server.hotkey_runtime_history_count = 0;
     lazyfreeResetStats();
 }
 
@@ -6863,30 +6815,18 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         info = sdscatprintf(info,
                             "hotkey_enabled:%d\r\n"
                             "hotkey_sampling_ratio:%d\r\n"
-                            "hotkey_read_threshold:%d\r\n"
-                            "hotkey_write_threshold:%d\r\n"
                             "hotkey_window_seconds:%d\r\n"
                             "hotkey_cms_bucket_size:%d\r\n"
                             "hotkey_cms_depth:%d\r\n"
-                            "hotkey_history_max_count:%d\r\n"
-                            "hotkey_history_ttl:%d\r\n"
-                            "hotkey_runtime_total_sampled:%llu\r\n"
-                            "hotkey_runtime_read_count:%llu\r\n"
-                            "hotkey_runtime_write_count:%llu\r\n"
-                            "hotkey_runtime_history_count:%u\r\n",
+                            "hotkey_top_k:%d\r\n"
+                            "hotkey_runtime_total_sampled:%llu\r\n",
                             server.hotkey_enabled,
                             server.hotkey_sampling_ratio,
-                            server.hotkey_read_threshold,
-                            server.hotkey_write_threshold,
                             server.hotkey_window_seconds,
                             server.hotkey_cms_bucket_size,
                             server.hotkey_cms_depth,
-                            server.hotkey_history_max_count,
-                            server.hotkey_history_ttl,
-                            server.hotkey_runtime_total_sampled,
-                            server.hotkey_runtime_read_count,
-                            server.hotkey_runtime_write_count,
-                            server.hotkey_runtime_history_count);
+                            server.hotkey_top_k,
+                            server.hotkey_runtime_total_sampled);
     }
 
     /* Get info from modules.
