@@ -199,6 +199,7 @@ void readHotKeyDetection(robj *key, int val_type, int slot) {
 
     UNUSED(val_type);
     if (!m || !key) return;
+    if (slot < 0 || slot >= HOTKEY_SLOTS) return;
     server.hotkey_runtime_total_sampled++;
     if (!m->read_summaries[slot])
         m->read_summaries[slot] = hotkeyMGSummaryNew(server.hotkey_max_keys);
@@ -210,6 +211,7 @@ void writeHotKeyDetection(robj *key, int val_type, int slot) {
 
     UNUSED(val_type);
     if (!m || !key) return;
+    if (slot < 0 || slot >= HOTKEY_SLOTS) return;
     server.hotkey_runtime_total_sampled++;
     if (!m->write_summaries[slot])
         m->write_summaries[slot] = hotkeyMGSummaryNew(server.hotkey_max_keys);
@@ -242,7 +244,7 @@ void hotkeysGetCommand(client *c) {
     hotkeyManager *m;
     hotkeyMGSummary *s;
     hotkeyMGCollected *collected;
-    int capacity;
+    int count;
 
     if (!server.hotkey_enabled) {
         addReplyError(c, "Hotkey detection is disabled");
@@ -255,9 +257,32 @@ void hotkeysGetCommand(client *c) {
     }
     if (!parseHotkeyFilterArgs(c, 2, &filter_type, &filter_slot)) return;
 
-    /* Collect all active entries from MG summaries based on counters. */
-    capacity = server.hotkey_max_keys * HOTKEY_SLOTS * 2;
-    collected = zmalloc(capacity * sizeof(hotkeyMGCollected));
+    /* First pass: count active entries to allocate exactly. */
+    count = 0;
+    for (slot = 0; slot < HOTKEY_SLOTS; slot++) {
+        if (filter_slot != -1 && slot != filter_slot) continue;
+        if (filter_type == -1 || filter_type == 1) {
+            s = m->read_summaries[slot];
+            if (s) {
+                for (i = 0; i < s->size; i++)
+                    if (s->keys[i]) count++;
+            }
+        }
+        if (filter_type == -1 || filter_type == 0) {
+            s = m->write_summaries[slot];
+            if (s) {
+                for (i = 0; i < s->size; i++)
+                    if (s->keys[i]) count++;
+            }
+        }
+    }
+
+    if (count == 0) {
+        addReplyArrayLen(c, 0);
+        return;
+    }
+
+    collected = zmalloc(count * sizeof(hotkeyMGCollected));
     n = 0;
 
     for (slot = 0; slot < HOTKEY_SLOTS; slot++) {

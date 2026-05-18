@@ -1730,12 +1730,12 @@ typedef struct {
 
 /* Misra-Gries summary: three parallel arrays of at most max_keys entries */
 typedef struct {
-    sds *keys;              /* Key names (NULL = empty slot) */
-    uint64_t *counters;     /* Access count for key at position [i] */
-    uint64_t *decrements;   /* Decrement count for key at position [i] */
-    int max_keys;           /* Capacity (k) */
-    int size;               /* Current number of active entries */
-    uint64_t total;         /* Total observations in current window */
+    sds *keys;            /* Key names (NULL = empty slot) */
+    uint64_t *counters;   /* Access count for key at position [i] */
+    uint64_t *decrements; /* Decrement count for key at position [i] */
+    int max_keys;         /* Capacity (k) */
+    int size;             /* Current number of active entries */
+    uint64_t total;       /* Total observations in current window */
 } hotkeyMGSummary;
 
 /* Hotkey manager: per-slot Misra-Gries summaries */
