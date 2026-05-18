@@ -834,27 +834,6 @@ dictType sdsHashDictType = {
     .entryDestructor = dictEntryDestructorSdsKeyHeapValue,
 };
 
-void dictEntryDestructorHotkeyLRUNode(void *entry) {
-    dictEntry *de = entry;
-    hotkeyLRUNode *node = (hotkeyLRUNode *)dictGetVal(de);
-    if (node) {
-        if (node->key) {
-            sdsfree(node->key);
-        }
-        if (node->entry) {
-            zfree(node->entry);
-        }
-        zfree(node);
-    }
-    zfree(de);
-}
-
-dictType hotkeyHistoryDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsHash,
-    .keyCompare = dictSdsKeyCompare,
-    .entryDestructor = dictEntryDestructorHotkeyLRUNode,
-};
 
 size_t clientHashtableTypeMetadataSize(void) {
     return sizeof(void *);
@@ -1703,19 +1682,6 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
         if ((server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) &&
             server.aof_last_write_status == C_ERR) {
             flushAppendOnlyFile(0);
-        }
-    }
-
-    run_with_period(server.hotkey_history_ttl * 100) {
-        if (server.hotkey_enabled) {
-            expireHotkeyHistory(server.hotkey_manager);
-        }
-    }
-
-    run_with_period(server.hotkey_window_seconds * 1000) {
-        if (server.hotkey_enabled) {
-            addHotkeyToHistory(server.hotkey_manager);
-            hotkeyManagerReset(server.hotkey_manager);
         }
     }
 
@@ -2893,9 +2859,6 @@ void resetServerStats(void) {
     server.stat_active_time = 0;
     server.el_iteration_active = false;
     server.hotkey_runtime_total_sampled = 0;
-    server.hotkey_runtime_read_count = 0;
-    server.hotkey_runtime_write_count = 0;
-    server.hotkey_runtime_history_count = 0;
     lazyfreeResetStats();
 }
 
@@ -6825,23 +6788,11 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                             "hotkey_enabled:%d\r\n"
                             "hotkey_max_keys:%d\r\n"
                             "hotkey_sampling_ratio:%d\r\n"
-                            "hotkey_window_seconds:%d\r\n"
-                            "hotkey_history_max_count:%d\r\n"
-                            "hotkey_history_ttl:%d\r\n"
-                            "hotkey_runtime_total_sampled:%llu\r\n"
-                            "hotkey_runtime_read_count:%llu\r\n"
-                            "hotkey_runtime_write_count:%llu\r\n"
-                            "hotkey_runtime_history_count:%u\r\n",
+                            "hotkey_runtime_total_sampled:%llu\r\n",
                             server.hotkey_enabled,
                             server.hotkey_max_keys,
                             server.hotkey_sampling_ratio,
-                            server.hotkey_window_seconds,
-                            server.hotkey_history_max_count,
-                            server.hotkey_history_ttl,
-                            server.hotkey_runtime_total_sampled,
-                            server.hotkey_runtime_read_count,
-                            server.hotkey_runtime_write_count,
-                            server.hotkey_runtime_history_count);
+                            server.hotkey_runtime_total_sampled);
     }
 
     /* Get info from modules.

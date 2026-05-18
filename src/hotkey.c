@@ -56,34 +56,6 @@ static int parseHotkeyFilterArgs(client *c, int start_idx, int *filter_type, int
     return 1;
 }
 
-/* Check if a history entry matches the given type and slot filters. */
-static int matchesFilter(hotkeyHistoryEntry *e, int filter_type, int filter_slot) {
-    if (!e) return 0;
-    if (filter_type != -1 && e->is_read != filter_type) return 0;
-    if (filter_slot != -1 && e->slot != filter_slot) return 0;
-    return 1;
-}
-
-/* Format and send a single hotkey history entry to the client.
- * node->key has a 1-byte type prefix (\x00=read, \x01=write) used for
- * dict keying; skip it when replying to the client. */
-static void replyWithHotkeyEntry(client *c, hotkeyLRUNode *node) {
-    addReplyArrayLen(c, 14);
-    addReplyBulkCString(c, "key");
-    addReplyBulkCBuffer(c, node->key + 1, sdslen(node->key) - 1);
-    addReplyBulkCString(c, "type");
-    addReplyBulkCString(c, node->entry->is_read ? "read" : "write");
-    addReplyBulkCString(c, "slot");
-    addReplyLongLong(c, node->entry->slot);
-    addReplyBulkCString(c, "peak_qps");
-    addReplyLongLong(c, node->entry->peak_qps);
-    addReplyBulkCString(c, "first_detected");
-    addReplyLongLong(c, node->entry->first_detected);
-    addReplyBulkCString(c, "last_detected");
-    addReplyLongLong(c, node->entry->last_detected);
-    addReplyBulkCString(c, "duration");
-    addReplyLongLong(c, node->entry->duration);
-}
 
 /* ===========================================================================
  * Misra-Gries summary operations
@@ -91,7 +63,9 @@ static void replyWithHotkeyEntry(client *c, hotkeyLRUNode *node) {
 
 hotkeyMGSummary *hotkeyMGSummaryNew(int max_keys) {
     hotkeyMGSummary *s = zcalloc(sizeof(hotkeyMGSummary));
-    s->entries = zcalloc(max_keys * sizeof(hotkeyMGEntry));
+    s->keys = zcalloc(max_keys * sizeof(sds));
+    s->counters = zcalloc(max_keys * sizeof(uint64_t));
+    s->decrements = zcalloc(max_keys * sizeof(uint64_t));
     s->max_keys = max_keys;
     s->size = 0;
     s->total = 0;
@@ -103,9 +77,11 @@ void hotkeyMGSummaryFree(hotkeyMGSummary *s) {
 
     if (!s) return;
     for (i = 0; i < s->size; i++) {
-        if (s->entries[i].key) sdsfree(s->entries[i].key);
+        if (s->keys[i]) sdsfree(s->keys[i]);
     }
-    zfree(s->entries);
+    zfree(s->keys);
+    zfree(s->counters);
+    zfree(s->decrements);
     zfree(s);
 }
 
@@ -114,9 +90,10 @@ static void hotkeyMGSummaryReset(hotkeyMGSummary *s) {
 
     if (!s) return;
     for (i = 0; i < s->size; i++) {
-        if (s->entries[i].key) sdsfree(s->entries[i].key);
-        s->entries[i].key = NULL;
-        s->entries[i].count = 0;
+        if (s->keys[i]) sdsfree(s->keys[i]);
+        s->keys[i] = NULL;
+        s->counters[i] = 0;
+        s->decrements[i] = 0;
     }
     s->size = 0;
     s->total = 0;
@@ -126,12 +103,13 @@ static void hotkeyMGSummaryReset(hotkeyMGSummary *s) {
  *
  * Three cases:
  * 1. Key already tracked: increment its counter.
- * 2. Room available (size < k): insert new entry.
- * 3. Full: decrement all counters, compact out zeros. */
-static void hotkeyMGSummaryAdd(hotkeyMGSummary *s, robj *key, int val_type) {
+ * 2. Empty slot available: insert new entry.
+ * 3. No empty slot: increment decrements for all, evict any where
+ *    counters[i] - decrements[i] == 0. */
+static void hotkeyMGSummaryAdd(hotkeyMGSummary *s, robj *key) {
     const char *k;
     size_t klen;
-    int i, write_pos;
+    int i, empty_slot;
 
     if (!s || !key || !objectGetVal(key)) return;
 
@@ -139,41 +117,44 @@ static void hotkeyMGSummaryAdd(hotkeyMGSummary *s, robj *key, int val_type) {
     k = objectGetVal(key);
     klen = sdslen(objectGetVal(key));
 
-    /* Case 1: key already tracked. */
+    /* Case 1: key already tracked — increment its access counter.
+     * Also track first empty slot we pass for potential insertion. */
+    empty_slot = -1;
     for (i = 0; i < s->size; i++) {
-        if (s->entries[i].key &&
-            sdslen(s->entries[i].key) == klen &&
-            memcmp(s->entries[i].key, k, klen) == 0) {
-            s->entries[i].count++;
-            s->entries[i].val_type = val_type;
+        if (!s->keys[i]) {
+            if (empty_slot == -1) empty_slot = i;
+            continue;
+        }
+        if (sdslen(s->keys[i]) == klen &&
+            memcmp(s->keys[i], k, klen) == 0) {
+            s->counters[i]++;
             return;
         }
     }
 
-    /* Case 2: room available. */
+    /* Case 2: empty slot available. */
     if (s->size < s->max_keys) {
-        s->entries[s->size].key = sdsnewlen(k, klen);
-        s->entries[s->size].count = 1;
-        s->entries[s->size].val_type = val_type;
+        s->keys[s->size] = sdsnewlen(k, klen);
+        s->counters[s->size] = 1;
+        s->decrements[s->size] = 0;
         s->size++;
         return;
     }
+    if (empty_slot != -1) {
+        s->keys[empty_slot] = sdsnewlen(k, klen);
+        s->counters[empty_slot] = 1;
+        s->decrements[empty_slot] = 0;
+        return;
+    }
 
-    /* Case 3: full — decrement all, compact out zeros. */
-    write_pos = 0;
+    /* Case 3: no empty slot — increment decrements, evict zeros. */
     for (i = 0; i < s->size; i++) {
-        s->entries[i].count--;
-        if (s->entries[i].count > 0) {
-            if (write_pos != i) {
-                s->entries[write_pos] = s->entries[i];
-            }
-            write_pos++;
-        } else {
-            sdsfree(s->entries[i].key);
-            s->entries[i].key = NULL;
+        s->decrements[i]++;
+        if (s->counters[i] - s->decrements[i] == 0) {
+            sdsfree(s->keys[i]);
+            s->keys[i] = NULL;
         }
     }
-    s->size = write_pos;
 }
 
 /* ===========================================================================
@@ -185,8 +166,6 @@ hotkeyManager *hotkeyManagerInit(int max_keys) {
 
     UNUSED(max_keys);
     m = zcalloc(sizeof(hotkeyManager));
-    m->history_dict = dictCreate(&hotkeyHistoryDictType);
-    m->history_lru = zcalloc(sizeof(hotkeyLRU));
     return m;
 }
 
@@ -198,8 +177,6 @@ void hotkeyManagerFree(hotkeyManager *m) {
         if (m->read_summaries[i]) hotkeyMGSummaryFree(m->read_summaries[i]);
         if (m->write_summaries[i]) hotkeyMGSummaryFree(m->write_summaries[i]);
     }
-    if (m->history_dict) dictRelease(m->history_dict);
-    if (m->history_lru) zfree(m->history_lru);
     zfree(m);
 }
 
@@ -220,276 +197,121 @@ void hotkeyManagerReset(hotkeyManager *m) {
 void readHotKeyDetection(robj *key, int val_type, int slot) {
     hotkeyManager *m = server.hotkey_manager;
 
+    UNUSED(val_type);
     if (!m || !key) return;
     server.hotkey_runtime_total_sampled++;
     if (!m->read_summaries[slot])
         m->read_summaries[slot] = hotkeyMGSummaryNew(server.hotkey_max_keys);
-    hotkeyMGSummaryAdd(m->read_summaries[slot], key, val_type);
+    hotkeyMGSummaryAdd(m->read_summaries[slot], key);
 }
 
 void writeHotKeyDetection(robj *key, int val_type, int slot) {
     hotkeyManager *m = server.hotkey_manager;
 
+    UNUSED(val_type);
     if (!m || !key) return;
     server.hotkey_runtime_total_sampled++;
     if (!m->write_summaries[slot])
         m->write_summaries[slot] = hotkeyMGSummaryNew(server.hotkey_max_keys);
-    hotkeyMGSummaryAdd(m->write_summaries[slot], key, val_type);
+    hotkeyMGSummaryAdd(m->write_summaries[slot], key);
 }
 
-/* ===========================================================================
- * LRU history list helpers
- * ==========================================================================*/
-
-static void hotkeyLRUMoveToHead(hotkeyLRU *lru, hotkeyLRUNode *node) {
-    if (!lru || !node || lru->head == node) return;
-
-    /* Unlink from current position. */
-    if (node->prev) node->prev->next = node->next;
-    if (node->next) node->next->prev = node->prev;
-    if (lru->tail == node) lru->tail = node->prev;
-
-    /* Insert at head. */
-    node->prev = NULL;
-    node->next = lru->head;
-    if (lru->head) lru->head->prev = node;
-    lru->head = node;
-    if (!lru->tail) lru->tail = node;
-}
-
-static hotkeyLRUNode *hotkeyLRUAddToHead(hotkeyLRU *lru, sds key, hotkeyHistoryEntry *entry) {
-    hotkeyLRUNode *node = zcalloc(sizeof(hotkeyLRUNode));
-
-    node->key = key;
-    node->entry = entry;
-    node->next = lru->head;
-    if (lru->head) lru->head->prev = node;
-    lru->head = node;
-    if (!lru->tail) lru->tail = node;
-    lru->size++;
-    return node;
-}
-
-static hotkeyLRUNode *hotkeyLRURemoveTail(hotkeyLRU *lru) {
-    hotkeyLRUNode *tail;
-
-    if (!lru || !lru->tail) return NULL;
-    tail = lru->tail;
-    if (tail->prev) {
-        tail->prev->next = NULL;
-        lru->tail = tail->prev;
-    } else {
-        lru->head = NULL;
-        lru->tail = NULL;
-    }
-    lru->size--;
-    return tail;
-}
-
-/* Evict the oldest (tail) entry from the history LRU. */
-static void evictLRUHistoryEntry(hotkeyManager *m) {
-    hotkeyLRUNode *tail = hotkeyLRURemoveTail(m->history_lru);
-
-    if (!tail) return;
-    if (tail->key && m->history_dict) {
-        dictDelete(m->history_dict, tail->key);
-    } else {
-        if (tail->key) sdsfree(tail->key);
-        if (tail->entry) zfree(tail->entry);
-        zfree(tail);
-    }
-}
-
-/* ===========================================================================
- * History management
- * ==========================================================================*/
-
-/* Extrapolate QPS from the sampled count, sampling ratio, and window size. */
-static uint64_t calculateQPS(uint64_t count) {
-    if (server.hotkey_sampling_ratio <= 0 || server.hotkey_window_seconds <= 0)
-        return 0;
-    return (count * 100 / server.hotkey_sampling_ratio) / server.hotkey_window_seconds;
-}
-
-/* Upsert a single key into the global history. If the key already exists,
- * update its peak QPS and timestamps; otherwise create a new entry (possibly
- * evicting the oldest one). */
-static void addSingleToHistory(hotkeyManager *m, sds key_str, uint64_t count, int val_type, int is_read, int slot) {
-    time_t now;
-    uint64_t qps;
-    dictEntry *de;
-    hotkeyHistoryEntry *h;
-    hotkeyLRUNode *node;
-    sds ks;
-    char prefix;
-
-    if (!m || !key_str) return;
-    now = time(NULL);
-    qps = calculateQPS(count);
-
-    /* Build composite lookup key: 1-byte type prefix + original key.
-     * This ensures read and write entries for the same key are distinct. */
-    prefix = is_read ? '\x00' : '\x01';
-    ks = sdsnewlen(&prefix, 1);
-    ks = sdscatsds(ks, key_str);
-
-    /* If key already in history, update and move to head. */
-    de = dictFind(m->history_dict, ks);
-    if (de) {
-        sdsfree(ks);
-        node = dictGetVal(de);
-        if (!node || !node->entry) return;
-        h = node->entry;
-        if (h->peak_qps < qps) h->peak_qps = qps;
-        h->last_detected = now;
-        h->duration += server.hotkey_window_seconds;
-        h->val_type = val_type;
-        h->slot = slot;
-        hotkeyLRUMoveToHead(m->history_lru, node);
-        return;
-    }
-
-    /* Evict oldest entries if we are at capacity. */
-    while (m->history_lru->size >= (size_t)server.hotkey_history_max_count) {
-        size_t old = m->history_lru->size;
-        evictLRUHistoryEntry(m);
-        if (m->history_lru->size >= old) break;
-    }
-
-    /* Create new history entry. */
-    h = zcalloc(sizeof(hotkeyHistoryEntry));
-    h->peak_qps = qps;
-    h->first_detected = now;
-    h->last_detected = now;
-    h->is_read = is_read;
-    h->duration = server.hotkey_window_seconds;
-    h->val_type = val_type;
-    h->slot = slot;
-
-    node = hotkeyLRUAddToHead(m->history_lru, ks, h);
-    if (dictAdd(m->history_dict, ks, node) != DICT_OK) {
-        /* Dict add failed — undo the LRU insertion. */
-        if (m->history_lru->head == node) {
-            m->history_lru->head = node->next;
-            if (node->next)
-                node->next->prev = NULL;
-            else
-                m->history_lru->tail = NULL;
-            m->history_lru->size--;
-        }
-        sdsfree(ks);
-        zfree(h);
-        zfree(node);
-    }
-}
-
-/* Flush all per-slot MG summaries into the global history.
- * Called periodically from serverCron. */
-void addHotkeyToHistory(hotkeyManager *m) {
-    int slot, i;
-    hotkeyMGSummary *rs, *ws;
-
-    if (!m) return;
-
-    for (slot = 0; slot < HOTKEY_SLOTS; slot++) {
-        rs = m->read_summaries[slot];
-        if (rs && rs->size > 0) {
-            for (i = 0; i < rs->size; i++) {
-                if (!rs->entries[i].key) continue;
-                addSingleToHistory(m, rs->entries[i].key,
-                                   rs->entries[i].count,
-                                   rs->entries[i].val_type, 1, slot);
-                server.hotkey_runtime_read_count++;
-            }
-        }
-        ws = m->write_summaries[slot];
-        if (ws && ws->size > 0) {
-            for (i = 0; i < ws->size; i++) {
-                if (!ws->entries[i].key) continue;
-                addSingleToHistory(m, ws->entries[i].key,
-                                   ws->entries[i].count,
-                                   ws->entries[i].val_type, 0, slot);
-                server.hotkey_runtime_write_count++;
-            }
-        }
-    }
-
-    server.hotkey_runtime_history_count = m->history_lru->size;
-}
-
-/* Remove history entries whose last_detected time is older than the TTL. */
-void expireHotkeyHistory(hotkeyManager *m) {
-    time_t expire;
-    hotkeyLRUNode *cur, *prev;
-
-    if (!m || !m->history_lru || !m->history_dict) return;
-    expire = time(NULL) - server.hotkey_history_ttl;
-    cur = m->history_lru->tail;
-
-    while (cur) {
-        prev = cur->prev;
-        if (cur->entry && cur->entry->last_detected < expire) {
-            /* Unlink node. */
-            if (cur->prev)
-                cur->prev->next = cur->next;
-            else
-                m->history_lru->head = cur->next;
-            if (cur->next)
-                cur->next->prev = cur->prev;
-            else
-                m->history_lru->tail = cur->prev;
-            m->history_lru->size--;
-            if (cur->key) dictDelete(m->history_dict, cur->key);
-        } else {
-            break;
-        }
-        cur = prev;
-    }
-    server.hotkey_runtime_history_count = m->history_lru->size;
-}
 
 /* ===========================================================================
  * HOTKEYS commands
  * ==========================================================================*/
 
+/* Entry used for collecting and sorting active MG slots. */
+typedef struct {
+    sds key;
+    uint64_t count;
+    int slot;
+    int is_read;
+} hotkeyMGCollected;
+
+static int hotkeyMGCollectedCmp(const void *a, const void *b) {
+    const hotkeyMGCollected *ea = a;
+    const hotkeyMGCollected *eb = b;
+    if (eb->count > ea->count) return 1;
+    if (eb->count < ea->count) return -1;
+    return 0;
+}
+
 void hotkeysGetCommand(client *c) {
-    int filter_type, filter_slot, count;
-    hotkeyLRUNode *cur;
+    int filter_type, filter_slot, slot, i, n, limit;
+    hotkeyManager *m;
+    hotkeyMGSummary *s;
+    hotkeyMGCollected *collected;
+    int capacity;
 
     if (!server.hotkey_enabled) {
         addReplyError(c, "Hotkey detection is disabled");
         return;
     }
-    if (!server.hotkey_manager || !server.hotkey_manager->history_lru) {
+    m = server.hotkey_manager;
+    if (!m) {
         addReplyArrayLen(c, 0);
         return;
     }
     if (!parseHotkeyFilterArgs(c, 2, &filter_type, &filter_slot)) return;
 
-    expireHotkeyHistory(server.hotkey_manager);
-    if (!server.hotkey_manager || !server.hotkey_manager->history_lru) {
-        addReplyArrayLen(c, 0);
-        return;
-    }
+    /* Collect all active entries from MG summaries based on counters. */
+    capacity = server.hotkey_max_keys * HOTKEY_SLOTS * 2;
+    collected = zmalloc(capacity * sizeof(hotkeyMGCollected));
+    n = 0;
 
-    /* Count matching entries. */
-    count = 0;
-    cur = server.hotkey_manager->history_lru->head;
-    while (cur) {
-        if (matchesFilter(cur->entry, filter_type, filter_slot)) count++;
-        cur = cur->next;
-    }
+    for (slot = 0; slot < HOTKEY_SLOTS; slot++) {
+        if (filter_slot != -1 && slot != filter_slot) continue;
 
-    /* Reply with matching entries. */
-    addReplyArrayLen(c, count);
-    cur = server.hotkey_manager->history_lru->head;
-    while (cur) {
-        if (cur->entry && cur->key &&
-            matchesFilter(cur->entry, filter_type, filter_slot)) {
-            replyWithHotkeyEntry(c, cur);
+        /* Read summaries. */
+        if (filter_type == -1 || filter_type == 1) {
+            s = m->read_summaries[slot];
+            if (s) {
+                for (i = 0; i < s->size; i++) {
+                    if (!s->keys[i]) continue;
+                    collected[n].key = s->keys[i];
+                    collected[n].count = s->counters[i];
+                    collected[n].slot = slot;
+                    collected[n].is_read = 1;
+                    n++;
+                }
+            }
         }
-        cur = cur->next;
+
+        /* Write summaries. */
+        if (filter_type == -1 || filter_type == 0) {
+            s = m->write_summaries[slot];
+            if (s) {
+                for (i = 0; i < s->size; i++) {
+                    if (!s->keys[i]) continue;
+                    collected[n].key = s->keys[i];
+                    collected[n].count = s->counters[i];
+                    collected[n].slot = slot;
+                    collected[n].is_read = 0;
+                    n++;
+                }
+            }
+        }
     }
+
+    /* Sort by counter descending. */
+    if (n > 0) qsort(collected, n, sizeof(hotkeyMGCollected), hotkeyMGCollectedCmp);
+
+    /* Return top K results. */
+    limit = n < server.hotkey_max_keys ? n : server.hotkey_max_keys;
+    addReplyArrayLen(c, limit);
+    for (i = 0; i < limit; i++) {
+        addReplyArrayLen(c, 8);
+        addReplyBulkCString(c, "key");
+        addReplyBulkCBuffer(c, collected[i].key, sdslen(collected[i].key));
+        addReplyBulkCString(c, "type");
+        addReplyBulkCString(c, collected[i].is_read ? "read" : "write");
+        addReplyBulkCString(c, "slot");
+        addReplyLongLong(c, collected[i].slot);
+        addReplyBulkCString(c, "count");
+        addReplyLongLong(c, collected[i].count);
+    }
+    zfree(collected);
 }
 
 void hotkeysResetCommand(client *c) {
@@ -498,15 +320,7 @@ void hotkeysResetCommand(client *c) {
         return;
     }
     if (server.hotkey_manager) {
-        if (server.hotkey_manager->history_dict)
-            dictEmpty(server.hotkey_manager->history_dict, NULL);
-        if (server.hotkey_manager->history_lru) {
-            server.hotkey_manager->history_lru->head = NULL;
-            server.hotkey_manager->history_lru->tail = NULL;
-            server.hotkey_manager->history_lru->size = 0;
-        }
         hotkeyManagerReset(server.hotkey_manager);
-        server.hotkey_runtime_history_count = 0;
     }
     addReply(c, shared.ok);
 }
@@ -564,7 +378,6 @@ int hotKeyEnabledCallback(const char **err) {
         if (server.hotkey_manager) {
             hotkeyManagerFree(server.hotkey_manager);
             server.hotkey_manager = NULL;
-            server.hotkey_runtime_history_count = 0;
         }
     }
     return 1;
@@ -576,7 +389,6 @@ int hotKeyMaxKeysCallback(const char **err) {
     if (server.hotkey_manager) {
         hotkeyManagerFree(server.hotkey_manager);
         server.hotkey_manager = NULL;
-        server.hotkey_runtime_history_count = 0;
     }
     server.hotkey_manager = hotkeyManagerInit(server.hotkey_max_keys);
     return 1;
@@ -586,14 +398,11 @@ int hotKeyMaxKeysCallback(const char **err) {
  * Slot purge (triggered on cluster slot migration / flush / reset)
  * ==========================================================================*/
 
-/* Purge all detection state and history entries for a single slot. */
 void hotkeyPurgeSlot(int slot) {
     hotkeyManager *m = server.hotkey_manager;
-    hotkeyLRUNode *cur, *next;
 
     if (!m) return;
 
-    /* Free per-slot summaries. */
     if (m->read_summaries[slot]) {
         hotkeyMGSummaryFree(m->read_summaries[slot]);
         m->read_summaries[slot] = NULL;
@@ -602,32 +411,8 @@ void hotkeyPurgeSlot(int slot) {
         hotkeyMGSummaryFree(m->write_summaries[slot]);
         m->write_summaries[slot] = NULL;
     }
-
-    /* Remove history entries belonging to this slot. */
-    if (m->history_lru && m->history_dict) {
-        cur = m->history_lru->head;
-        while (cur) {
-            next = cur->next;
-            if (cur->entry && cur->entry->slot == slot) {
-                if (cur->prev)
-                    cur->prev->next = cur->next;
-                else
-                    m->history_lru->head = cur->next;
-                if (cur->next)
-                    cur->next->prev = cur->prev;
-                else
-                    m->history_lru->tail = cur->prev;
-                m->history_lru->size--;
-                if (cur->key) dictDelete(m->history_dict, cur->key);
-            }
-            cur = next;
-        }
-    }
-    server.hotkey_runtime_history_count =
-        m->history_lru ? m->history_lru->size : 0;
 }
 
-/* Purge all detection state across all slots. */
 void hotkeyPurgeAll(void) {
     hotkeyManager *m = server.hotkey_manager;
     int i;
@@ -644,11 +429,4 @@ void hotkeyPurgeAll(void) {
             m->write_summaries[i] = NULL;
         }
     }
-    if (m->history_dict) dictEmpty(m->history_dict, NULL);
-    if (m->history_lru) {
-        m->history_lru->head = NULL;
-        m->history_lru->tail = NULL;
-        m->history_lru->size = 0;
-    }
-    server.hotkey_runtime_history_count = 0;
 }
