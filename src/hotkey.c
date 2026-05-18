@@ -82,7 +82,11 @@ void hotkeyCMSReset(hotkeyCMS *cms) {
 }
 
 /* ===========================================================================
- * Top-K tracker (flat array, linear scan)
+ * Top-K min-heap tracker
+ *
+ * Min-ordered by count: root has the smallest count. When full and a new key
+ * has a higher count than the root, evict the root. Linear scan for key
+ * lookup (K is small), heap sift for structural maintenance.
  * ==========================================================================*/
 
 static hotkeyTopK *hotkeyTopKNew(int capacity) {
@@ -112,47 +116,82 @@ static void hotkeyTopKReset(hotkeyTopK *tk) {
     tk->size = 0;
 }
 
-/* Insert or update a key in the top-K using linear scan.
- * If key exists: update count.
- * If room: append.
- * If full: evict the entry with the smallest count if new count is larger. */
-static void hotkeyTopKAdd(hotkeyTopK *tk, robj *key, uint64_t count, int val_type) {
-    const char *k = objectGetVal(key);
-    size_t klen = sdslen(objectGetVal(key));
+static void heapSwap(hotkeyTopK *tk, int a, int b) {
+    hotkeyTopKEntry tmp = tk->entries[a];
+    tk->entries[a] = tk->entries[b];
+    tk->entries[b] = tmp;
+}
 
-    /* Linear scan: check if key already tracked */
+static void heapSiftUp(hotkeyTopK *tk, int idx) {
+    while (idx > 0) {
+        int parent = (idx - 1) / 2;
+        if (tk->entries[idx].count < tk->entries[parent].count) {
+            heapSwap(tk, idx, parent);
+            idx = parent;
+        } else {
+            break;
+        }
+    }
+}
+
+static void heapSiftDown(hotkeyTopK *tk, int idx) {
+    while (1) {
+        int smallest = idx;
+        int left = 2 * idx + 1;
+        int right = 2 * idx + 2;
+        if (left < tk->size && tk->entries[left].count < tk->entries[smallest].count)
+            smallest = left;
+        if (right < tk->size && tk->entries[right].count < tk->entries[smallest].count)
+            smallest = right;
+        if (smallest == idx) break;
+        heapSwap(tk, idx, smallest);
+        idx = smallest;
+    }
+}
+
+/* Find key index in heap by linear scan. Returns -1 if not found. */
+static int hotkeyTopKFind(hotkeyTopK *tk, const char *k, size_t klen) {
     for (int i = 0; i < tk->size; i++) {
         if (tk->entries[i].key &&
             sdslen(tk->entries[i].key) == klen &&
             memcmp(tk->entries[i].key, k, klen) == 0) {
-            tk->entries[i].count = count;
-            tk->entries[i].val_type = val_type;
-            return;
+            return i;
         }
     }
+    return -1;
+}
 
-    /* Room available */
-    if (tk->size < tk->capacity) {
-        tk->entries[tk->size].key = sdsnewlen(k, klen);
-        tk->entries[tk->size].count = count;
-        tk->entries[tk->size].val_type = val_type;
-        tk->size++;
+static void hotkeyTopKAdd(hotkeyTopK *tk, robj *key, uint64_t count, int val_type) {
+    sds k = objectGetVal(key);
+    size_t klen = sdslen(k);
+
+    /* Key already in heap — update count and fix heap order */
+    int idx = hotkeyTopKFind(tk, k, klen);
+    if (idx >= 0) {
+        tk->entries[idx].count = count;
+        tk->entries[idx].val_type = val_type;
+        heapSiftDown(tk, idx);
         return;
     }
 
-    /* Full: find minimum entry */
-    int min_idx = 0;
-    for (int i = 1; i < tk->size; i++) {
-        if (tk->entries[i].count < tk->entries[min_idx].count)
-            min_idx = i;
+    /* Room available — insert at end and sift up */
+    if (tk->size < tk->capacity) {
+        idx = tk->size;
+        tk->entries[idx].key = sdsnewlen(k, klen);
+        tk->entries[idx].count = count;
+        tk->entries[idx].val_type = val_type;
+        tk->size++;
+        heapSiftUp(tk, idx);
+        return;
     }
 
-    /* Evict if new count is larger than the minimum */
-    if (count > tk->entries[min_idx].count) {
-        sdsfree(tk->entries[min_idx].key);
-        tk->entries[min_idx].key = sdsnewlen(k, klen);
-        tk->entries[min_idx].count = count;
-        tk->entries[min_idx].val_type = val_type;
+    /* Full — evict root if new count is larger */
+    if (count > tk->entries[0].count) {
+        sdsfree(tk->entries[0].key);
+        tk->entries[0].key = sdsnewlen(k, klen);
+        tk->entries[0].count = count;
+        tk->entries[0].val_type = val_type;
+        heapSiftDown(tk, 0);
     }
 }
 
@@ -209,6 +248,26 @@ void hotkeyManagerReset(hotkeyManager *m) {
     if (!m) return;
     for (int i = 0; i < HOTKEY_SLOTS; i++) {
         if (m->slots[i]) hotkeySlotStateReset(m->slots[i]);
+    }
+}
+
+void hotkeyPurgeSlot(int slot) {
+    hotkeyManager *m = server.hotkey_manager;
+    if (!m || slot < 0 || slot >= HOTKEY_SLOTS) return;
+    if (m->slots[slot]) {
+        hotkeySlotStateFree(m->slots[slot]);
+        m->slots[slot] = NULL;
+    }
+}
+
+void hotkeyPurgeAll(void) {
+    hotkeyManager *m = server.hotkey_manager;
+    if (!m) return;
+    for (int i = 0; i < HOTKEY_SLOTS; i++) {
+        if (m->slots[i]) {
+            hotkeySlotStateFree(m->slots[i]);
+            m->slots[i] = NULL;
+        }
     }
 }
 

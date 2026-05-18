@@ -1736,18 +1736,18 @@ typedef struct {
     uint32_t width_mask; /* width - 1, used for bitwise optimization of modulo operation */
 } hotkeyCMS;
 
-/* Top-K entry in flat array */
+/* Min-heap entry for top-K hotkey tracking */
 typedef struct {
-    sds key;            /* Key name (NULL = empty slot) */
+    sds key;            /* Key name */
     uint64_t count;     /* CMS count estimate */
     int val_type;       /* Value type (OBJ_TYPE_*) */
 } hotkeyTopKEntry;
 
-/* Top-K tracker: flat array with linear scan, keeps K hottest keys */
+/* Min-heap top-K tracker: root is smallest, linear key search for membership */
 typedef struct {
-    hotkeyTopKEntry *entries; /* Fixed-size array */
+    hotkeyTopKEntry *entries; /* Heap array */
     int capacity;             /* Max entries (K) */
-    int size;                 /* Current active entries */
+    int size;                 /* Current entries */
 } hotkeyTopK;
 
 /* Per-slot hotkey state: CMS + top-K for read and write, lazily allocated */
@@ -2435,7 +2435,6 @@ struct valkeyServer {
     /* Hotkey parameters */
     int hotkey_enabled;                              /* Globally control the enabling / disabling of the hot key detection function. */
     int hotkey_sampling_ratio;                       /* The ratio of hotkey sampling. */
-    int hotkey_window_seconds;                       /* The time window size of hotkey detection. */
     int hotkey_cms_bucket_size;                      /* The size of the CMS bucket. */
     int hotkey_cms_depth;                            /* The depth of the CMS (number of hash functions). */
     int hotkey_top_k;                               /* Number of top keys to track per type in min-heap. */
@@ -4299,6 +4298,8 @@ void hotkeyCMSReset(hotkeyCMS *hotkey_cms);
 hotkeyManager *hotkeyManagerInit(size_t cms_width, size_t cms_depth);
 void hotkeyManagerFree(hotkeyManager *manager);
 void hotkeyManagerReset(hotkeyManager *manager);
+void hotkeyPurgeSlot(int slot);
+void hotkeyPurgeAll(void);
 void writeHotKeyDetection(robj *key, int val_type, int slot);
 void readHotKeyDetection(robj *key, int val_type, int slot);
 

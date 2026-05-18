@@ -33,7 +33,6 @@ start_server {tags {"hotkey"}} {
         r config set hotkey-sampling-ratio 100
         r config set hotkey-read-threshold 500
         r config set hotkey-write-threshold 300
-        r config set hotkey-window-seconds 1
         
         # Create test data
         r set "hot_read_key" "value"
@@ -169,9 +168,6 @@ start_server {tags {"hotkey"}} {
         set write_threshold [r config get hotkey-write-threshold]
         assert_equal [lindex $write_threshold 1] "1500"
         
-        # Test hotkey-window-seconds configuration
-        r config set hotkey-window-seconds 2
-        set window_seconds [r config get hotkey-window-seconds]
         assert_equal [lindex $window_seconds 1] "2"
         
         # Test hotkey-history-ttl configuration
@@ -267,7 +263,6 @@ start_server {tags {"hotkey"}} {
         r config set hotkey-sampling-ratio 100
         r config set hotkey-read-threshold 500
         r config set hotkey-write-threshold 300
-        r config set hotkey-window-seconds 1
         
         # High frequency access to single keys
         set hot_key_read "super_hot_key_read"
@@ -306,7 +301,6 @@ start_server {tags {"hotkey"}} {
         r config set hotkey-history-max-count 5
         r config set hotkey-sampling-ratio 100
         r config set hotkey-read-threshold 500
-        r config set hotkey-window-seconds 1
 
         # Create multiple hotkeys, exceeding maximum history count
         for {set i 1} {$i <= 8} {incr i} {
@@ -335,7 +329,6 @@ start_server {tags {"hotkey"}} {
         r config set hotkey-history-ttl 2
         r config set hotkey-sampling-ratio 100
         r config set hotkey-read-threshold 500
-        r config set hotkey-window-seconds 1
 
         # Create some hotkeys
         for {set i 1} {$i <= 600} {incr i} {
@@ -374,7 +367,6 @@ start_server {tags {"hotkey"}} {
         r config set hotkey-sampling-ratio 100
         r config set hotkey-read-threshold 500
         r config set hotkey-write-threshold 300
-        r config set hotkey-window-seconds 1
 
         # Create hotkeys
         for {set i 1} {$i <= 1500} {incr i} {
@@ -422,7 +414,6 @@ start_server {tags {"hotkey"}} {
         # Create some hotkeys
         r config set hotkey-sampling-ratio 100
         r config set hotkey-read-threshold 500
-        r config set hotkey-window-seconds 1
 
         # Create many different hotkeys
         for {set i 1} {$i <= 10} {incr i} {
@@ -456,7 +447,6 @@ start_server {tags {"hotkey"}} {
         r config set hotkey-history-max-count 3
         r config set hotkey-sampling-ratio 100
         r config set hotkey-read-threshold 500
-        r config set hotkey-window-seconds 1
 
         # Create first hotkey
         for {set i 1} {$i <= 450} {incr i} {
@@ -504,7 +494,6 @@ start_server {tags {"hotkey"}} {
         r config set hotkey-sampling-ratio 100
         r config set hotkey-read-threshold 500
         r config set hotkey-write-threshold 300
-        r config set hotkey-window-seconds 1
 
         # Get initial metric values
         set info_before [r info hotkey]

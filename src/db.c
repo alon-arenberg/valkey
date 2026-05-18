@@ -702,6 +702,9 @@ long long emptyData(int dbnum, int flags, void(callback)(hashtable *)) {
         functionReset(async, (void (*)(dict *))callback);
     }
 
+    /* Purge hotkey detection state on flush. */
+    if (server.hotkey_enabled) hotkeyPurgeAll();
+
     /* Also fire the end event. Note that this event will fire almost
      * immediately after the start event if the flush is asynchronous. */
     moduleFireServerEvent(VALKEYMODULE_EVENT_FLUSHDB, VALKEYMODULE_SUBEVENT_FLUSHDB_END, &fi);
