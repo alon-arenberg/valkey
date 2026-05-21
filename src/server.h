@@ -2417,6 +2417,7 @@ struct valkeyServer {
     int hotkey_enabled;                              /* Globally control the enabling / disabling of the hot key detection function. */
     int hotkey_sampling_ratio;                       /* The ratio of hotkey sampling (1-100%). */
     int hotkey_max_keys;                             /* Max tracked keys per slot (k). */
+    int hotkey_window_seconds;                       /* Detection window length in seconds. */
     unsigned long long hotkey_runtime_total_sampled; /* Total number of sampled keys */
     hotkeyManager *hotkey_manager;
 };

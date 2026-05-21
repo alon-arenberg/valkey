@@ -226,7 +226,7 @@ void writeHotKeyDetection(robj *key, int val_type, int slot) {
 /* Entry used for collecting and sorting active MG slots. */
 typedef struct {
     sds key;
-    uint64_t count;
+    uint64_t qps;
     int slot;
     int is_read;
 } hotkeyMGCollected;
@@ -234,9 +234,16 @@ typedef struct {
 static int hotkeyMGCollectedCmp(const void *a, const void *b) {
     const hotkeyMGCollected *ea = a;
     const hotkeyMGCollected *eb = b;
-    if (eb->count > ea->count) return 1;
-    if (eb->count < ea->count) return -1;
+    if (eb->qps > ea->qps) return 1;
+    if (eb->qps < ea->qps) return -1;
     return 0;
+}
+
+/* Extrapolate QPS from sampled count:
+ * qps = count * (100 / sampling_ratio) / window_seconds */
+static uint64_t hotkeyEstimateQPS(uint64_t count) {
+    if (server.hotkey_sampling_ratio <= 0 || server.hotkey_window_seconds <= 0) return 0;
+    return (count * 100 / server.hotkey_sampling_ratio) / server.hotkey_window_seconds;
 }
 
 void hotkeysGetCommand(client *c) {
@@ -288,14 +295,13 @@ void hotkeysGetCommand(client *c) {
     for (slot = 0; slot < HOTKEY_SLOTS; slot++) {
         if (filter_slot != -1 && slot != filter_slot) continue;
 
-        /* Read summaries. */
         if (filter_type == -1 || filter_type == 1) {
             s = m->read_summaries[slot];
             if (s) {
                 for (i = 0; i < s->size; i++) {
                     if (!s->keys[i]) continue;
                     collected[n].key = s->keys[i];
-                    collected[n].count = s->counters[i];
+                    collected[n].qps = hotkeyEstimateQPS(s->counters[i]);
                     collected[n].slot = slot;
                     collected[n].is_read = 1;
                     n++;
@@ -303,14 +309,13 @@ void hotkeysGetCommand(client *c) {
             }
         }
 
-        /* Write summaries. */
         if (filter_type == -1 || filter_type == 0) {
             s = m->write_summaries[slot];
             if (s) {
                 for (i = 0; i < s->size; i++) {
                     if (!s->keys[i]) continue;
                     collected[n].key = s->keys[i];
-                    collected[n].count = s->counters[i];
+                    collected[n].qps = hotkeyEstimateQPS(s->counters[i]);
                     collected[n].slot = slot;
                     collected[n].is_read = 0;
                     n++;
@@ -319,7 +324,7 @@ void hotkeysGetCommand(client *c) {
         }
     }
 
-    /* Sort by counter descending. */
+    /* Sort by QPS descending. */
     if (n > 0) qsort(collected, n, sizeof(hotkeyMGCollected), hotkeyMGCollectedCmp);
 
     /* Return top K results. */
@@ -333,8 +338,8 @@ void hotkeysGetCommand(client *c) {
         addReplyBulkCString(c, collected[i].is_read ? "read" : "write");
         addReplyBulkCString(c, "slot");
         addReplyLongLong(c, collected[i].slot);
-        addReplyBulkCString(c, "count");
-        addReplyLongLong(c, collected[i].count);
+        addReplyBulkCString(c, "qps");
+        addReplyLongLong(c, collected[i].qps);
     }
     zfree(collected);
 }

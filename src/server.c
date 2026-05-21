@@ -1685,6 +1685,12 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
         }
     }
 
+    run_with_period(server.hotkey_window_seconds * 1000) {
+        if (server.hotkey_enabled && server.hotkey_manager) {
+            hotkeyManagerReset(server.hotkey_manager);
+        }
+    }
+
     /* Clear the paused actions state if needed. */
     updatePausedActions();
 
@@ -6788,10 +6794,12 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                             "hotkey_enabled:%d\r\n"
                             "hotkey_max_keys:%d\r\n"
                             "hotkey_sampling_ratio:%d\r\n"
+                            "hotkey_window_seconds:%d\r\n"
                             "hotkey_runtime_total_sampled:%llu\r\n",
                             server.hotkey_enabled,
                             server.hotkey_max_keys,
                             server.hotkey_sampling_ratio,
+                            server.hotkey_window_seconds,
                             server.hotkey_runtime_total_sampled);
     }
 
