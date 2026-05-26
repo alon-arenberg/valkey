@@ -1,7 +1,7 @@
 {
     "GET": {
-        "summary": "Get hot keys from history",
-        "complexity": "O(N) where N is the number of hot keys in the history",
+        "summary": "Get the hottest keys in the current detection window",
+        "complexity": "O(N) where N is the number of tracked keys in the summary",
         "group": "server",
         "since": "9.0.0",
         "arity": -2,

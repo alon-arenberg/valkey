@@ -1726,23 +1726,24 @@ typedef struct {
  * Hotkey definition — Misra-Gries based hot key detection
  *----------------------------------------------------------------------------*/
 
-/* Number of hash slots for per-slot hotkey tracking (matches cluster slot count) */
 #define HOTKEY_SLOTS 16384
 
-/* Misra-Gries summary: three parallel arrays of at most max_keys entries */
+/* Misra-Gries summary: parallel arrays of at most max_keys entries */
 typedef struct {
     sds *keys;            /* Key names (NULL = empty slot) */
     uint64_t *counters;   /* Access count for key at position [i] */
     uint64_t *decrements; /* Decrement count for key at position [i] */
+    int *dbs;             /* Database id for key at position [i] */
+    int *slots;           /* Hash slot for key at position [i] */
     int max_keys;         /* Capacity (k) */
     int size;             /* Current number of active entries */
     uint64_t total;       /* Total observations in current window */
 } hotkeyMGSummary;
 
-/* Hotkey manager: per-slot Misra-Gries summaries */
+/* Hotkey manager: single global read + write summaries */
 typedef struct {
-    hotkeyMGSummary *read_summaries[HOTKEY_SLOTS];  /* Per-slot, lazily allocated */
-    hotkeyMGSummary *write_summaries[HOTKEY_SLOTS]; /* Per-slot, lazily allocated */
+    hotkeyMGSummary *read_summary;
+    hotkeyMGSummary *write_summary;
 } hotkeyManager;
 
 /*-----------------------------------------------------------------------------
@@ -4276,10 +4277,12 @@ void hotkeyMGSummaryFree(hotkeyMGSummary *s);
 hotkeyManager *hotkeyManagerInit(int max_keys);
 void hotkeyManagerFree(hotkeyManager *manager);
 void hotkeyManagerReset(hotkeyManager *manager);
-void writeHotKeyDetection(robj *key, int val_type, int slot);
-void readHotKeyDetection(robj *key, int val_type, int slot);
+void writeHotKeyDetection(robj *key, int val_type, int slot, int dbid);
+void readHotKeyDetection(robj *key, int val_type, int slot, int dbid);
 void hotkeyPurgeSlot(int slot);
 void hotkeyPurgeAll(void);
+void hotkeyPurgeDb(int dbid);
+void hotkeyInvalidateKey(robj *key, int dbid);
 
 /* Helper functions for getting database id args from argv, argc */
 int *selectDbIdArgs(robj **argv, int argc, int *count);

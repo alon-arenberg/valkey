@@ -1,7 +1,7 @@
 {
     "PURGE": {
         "summary": "Purge hot key detection state for a specific slot",
-        "complexity": "O(N) where N is the number of history entries to scan",
+        "complexity": "O(K) where K is the max tracked keys per summary",
         "group": "server",
         "since": "9.0.0",
         "arity": 4,

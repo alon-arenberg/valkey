@@ -29,9 +29,14 @@ start_server {tags {"hotkey"}} {
         set all_hotkeys [r hotkeys get]
         assert {[llength $all_hotkeys] > 0}
 
-        # Verify 8-field reply (key, type, slot, count)
+        # Verify 10-field reply (key, type, db, slot, qps)
         set first [lindex $all_hotkeys 0]
-        assert_equal [llength $first] 8
+        assert_equal [llength $first] 10
+        assert_equal [lindex $first 0] "key"
+        assert_equal [lindex $first 2] "type"
+        assert_equal [lindex $first 4] "db"
+        assert_equal [lindex $first 6] "slot"
+        assert_equal [lindex $first 8] "qps"
     }
 
     test "HOTKEYS GET with TYPE filter" {
@@ -54,10 +59,10 @@ start_server {tags {"hotkey"}} {
         assert_equal [llength $all_hotkeys] [expr {[llength $read_hotkeys] + [llength $write_hotkeys]}]
 
         foreach entry $read_hotkeys {
-            assert_equal [lindex $entry 3] "read" "TYPE read filter returned non-read entry"
+            assert_equal [lindex $entry 3] "read"
         }
         foreach entry $write_hotkeys {
-            assert_equal [lindex $entry 3] "write" "TYPE write filter returned non-write entry"
+            assert_equal [lindex $entry 3] "write"
         }
     }
 
@@ -72,18 +77,18 @@ start_server {tags {"hotkey"}} {
         set all_hotkeys [r hotkeys get]
         assert {[llength $all_hotkeys] > 0}
         set first [lindex $all_hotkeys 0]
-        set slot_val [lindex $first 5]
+        set slot_val [lindex $first 7]
 
         set slot_hotkeys [r hotkeys get SLOT $slot_val]
         assert {[llength $slot_hotkeys] > 0}
         foreach entry $slot_hotkeys {
-            assert_equal [lindex $entry 5] $slot_val "SLOT filter returned entry from wrong slot"
+            assert_equal [lindex $entry 7] $slot_val
         }
 
         # Filter by a different slot — should return nothing
         set other_slot [expr {($slot_val + 1) % 16384}]
         set other_hotkeys [r hotkeys get SLOT $other_slot]
-        assert_equal [llength $other_hotkeys] 0 "SLOT filter for inactive slot should return empty"
+        assert_equal [llength $other_hotkeys] 0
     }
 
     test "HOTKEYS GET with SLOT and TYPE combined" {
@@ -101,18 +106,18 @@ start_server {tags {"hotkey"}} {
         assert {[llength $all_hotkeys] >= 2}
 
         set first [lindex $all_hotkeys 0]
-        set slot_val [lindex $first 5]
+        set slot_val [lindex $first 7]
 
         set filtered [r hotkeys get SLOT $slot_val TYPE read]
         foreach entry $filtered {
-            assert_equal [lindex $entry 3] "read" "Combined filter returned non-read entry"
-            assert_equal [lindex $entry 5] $slot_val "Combined filter returned wrong slot"
+            assert_equal [lindex $entry 3] "read"
+            assert_equal [lindex $entry 7] $slot_val
         }
 
         set filtered2 [r hotkeys get TYPE write SLOT $slot_val]
         foreach entry $filtered2 {
-            assert_equal [lindex $entry 3] "write" "Combined filter returned non-write entry"
-            assert_equal [lindex $entry 5] $slot_val "Combined filter returned wrong slot"
+            assert_equal [lindex $entry 3] "write"
+            assert_equal [lindex $entry 7] $slot_val
         }
 
         set slot_all [r hotkeys get SLOT $slot_val]
@@ -171,9 +176,13 @@ start_server {tags {"hotkey"}} {
         r config set hotkey-max-keys 8
         assert_equal [lindex [r config get hotkey-max-keys] 1] "8"
 
+        r config set hotkey-window-seconds 2
+        assert_equal [lindex [r config get hotkey-window-seconds] 1] "2"
+
         # Restore defaults for subsequent tests
         r config set hotkey-sampling-ratio 100
         r config set hotkey-max-keys 16
+        r config set hotkey-window-seconds 1
     }
 
     test "Disable hotkey functionality" {
@@ -209,7 +218,7 @@ start_server {tags {"hotkey"}} {
         assert {[llength $write_hotkeys] > 0}
     }
 
-    test "HOTKEYS GET returns sorted by count descending" {
+    test "HOTKEYS GET returns sorted by QPS descending" {
         r hotkeys reset
         r config set hotkey-sampling-ratio 100
         r config set hotkey-max-keys 16
@@ -225,12 +234,12 @@ start_server {tags {"hotkey"}} {
         set hotkeys [r hotkeys get TYPE read]
         assert {[llength $hotkeys] >= 2}
 
-        # Verify sorted descending by count
-        set prev_count [lindex [lindex $hotkeys 0] 7]
+        # QPS is at field index 9
+        set prev_qps [lindex [lindex $hotkeys 0] 9]
         for {set i 1} {$i < [llength $hotkeys]} {incr i} {
-            set cur_count [lindex [lindex $hotkeys $i] 7]
-            assert {$prev_count >= $cur_count}
-            set prev_count $cur_count
+            set cur_qps [lindex [lindex $hotkeys $i] 9]
+            assert {$prev_qps >= $cur_qps}
+            set prev_qps $cur_qps
         }
     }
 
@@ -246,6 +255,69 @@ start_server {tags {"hotkey"}} {
 
         set hotkeys [r hotkeys get]
         assert {[llength $hotkeys] <= 3}
+
+        # Restore
+        r config set hotkey-max-keys 16
+    }
+
+    test "Hotkey entries include db field" {
+        r hotkeys reset
+        r config set hotkey-sampling-ratio 100
+        r config set hotkey-max-keys 16
+
+        r select 0
+        r set "db0_key" "val"
+        for {set i 0} {$i < 500} {incr i} { r get "db0_key" }
+
+        set hotkeys [r hotkeys get]
+        assert {[llength $hotkeys] > 0}
+        set first [lindex $hotkeys 0]
+        # db field at index 5
+        assert_equal [lindex $first 4] "db"
+        assert_equal [lindex $first 5] 0
+    }
+
+    test "Key deletion invalidates hotkey entry" {
+        r hotkeys reset
+        r config set hotkey-sampling-ratio 100
+        r config set hotkey-max-keys 16
+
+        r set "del_test_key" "val"
+        for {set i 0} {$i < 500} {incr i} { r get "del_test_key" }
+
+        set hotkeys_before [r hotkeys get TYPE read]
+        set found 0
+        foreach entry $hotkeys_before {
+            if {[lindex $entry 1] eq "del_test_key"} { set found 1 }
+        }
+        assert_equal $found 1
+
+        # Delete the key
+        r del "del_test_key"
+
+        set hotkeys_after [r hotkeys get TYPE read]
+        set found 0
+        foreach entry $hotkeys_after {
+            if {[lindex $entry 1] eq "del_test_key"} { set found 1 }
+        }
+        assert_equal $found 0
+    }
+
+    test "FLUSHALL purges all hotkey state" {
+        r hotkeys reset
+        r config set hotkey-sampling-ratio 100
+        r config set hotkey-max-keys 16
+
+        r set "flush_key" "val"
+        for {set i 0} {$i < 500} {incr i} { r get "flush_key" }
+
+        set hotkeys_before [r hotkeys get]
+        assert {[llength $hotkeys_before] > 0}
+
+        r flushall
+
+        set hotkeys_after [r hotkeys get]
+        assert_equal [llength $hotkeys_after] 0
     }
 
     test "Test memory cleanup on manager recreation" {
@@ -295,26 +367,26 @@ start_server {tags {"hotkey"}} {
         }
 
         assert {$final_total_sampled > $initial_total_sampled}
-
-        # Verify max_keys appears in INFO
         assert_match "*hotkey_max_keys:*" $info_after
+        assert_match "*hotkey_window_seconds:*" $info_after
     }
 
-    test "Hotkey entries include slot field" {
+    test "QPS calculation with sampling ratio" {
         r hotkeys reset
         r config set hotkey-sampling-ratio 100
         r config set hotkey-max-keys 16
+        r config set hotkey-window-seconds 1
 
-        r set "slot_test_key" "val"
-        for {set i 0} {$i < 600} {incr i} { r get "slot_test_key" }
+        r set "qps_key" "val"
+        for {set i 0} {$i < 1000} {incr i} { r get "qps_key" }
 
-        set hotkeys [r hotkeys get]
+        set hotkeys [r hotkeys get TYPE read]
         assert {[llength $hotkeys] > 0}
         set first [lindex $hotkeys 0]
-        assert_equal [llength $first] 8
-        assert_equal [lindex $first 4] "slot"
-        set slot_val [lindex $first 5]
-        assert {$slot_val >= 0 && $slot_val < 16384}
+        assert_equal [lindex $first 1] "qps_key"
+        # With 100% sampling and 1s window, qps = count
+        set qps [lindex $first 9]
+        assert {$qps == 1000}
     }
 
     test "Max-keys tracks the hottest keys" {

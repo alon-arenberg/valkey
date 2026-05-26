@@ -66,6 +66,8 @@ hotkeyMGSummary *hotkeyMGSummaryNew(int max_keys) {
     s->keys = zcalloc(max_keys * sizeof(sds));
     s->counters = zcalloc(max_keys * sizeof(uint64_t));
     s->decrements = zcalloc(max_keys * sizeof(uint64_t));
+    s->dbs = zcalloc(max_keys * sizeof(int));
+    s->slots = zcalloc(max_keys * sizeof(int));
     s->max_keys = max_keys;
     s->size = 0;
     s->total = 0;
@@ -82,6 +84,8 @@ void hotkeyMGSummaryFree(hotkeyMGSummary *s) {
     zfree(s->keys);
     zfree(s->counters);
     zfree(s->decrements);
+    zfree(s->dbs);
+    zfree(s->slots);
     zfree(s);
 }
 
@@ -94,6 +98,8 @@ static void hotkeyMGSummaryReset(hotkeyMGSummary *s) {
         s->keys[i] = NULL;
         s->counters[i] = 0;
         s->decrements[i] = 0;
+        s->dbs[i] = 0;
+        s->slots[i] = 0;
     }
     s->size = 0;
     s->total = 0;
@@ -106,10 +112,10 @@ static void hotkeyMGSummaryReset(hotkeyMGSummary *s) {
  * 2. Empty slot available: insert new entry.
  * 3. No empty slot: increment decrements for all, evict any where
  *    counters[i] - decrements[i] == 0. */
-static void hotkeyMGSummaryAdd(hotkeyMGSummary *s, robj *key) {
+static void hotkeyMGSummaryAdd(hotkeyMGSummary *s, robj *key, int dbid, int slot) {
     const char *k;
     size_t klen;
-    int i, empty_slot;
+    int i, empty_idx;
 
     if (!s || !key || !objectGetVal(key)) return;
 
@@ -117,15 +123,15 @@ static void hotkeyMGSummaryAdd(hotkeyMGSummary *s, robj *key) {
     k = objectGetVal(key);
     klen = sdslen(objectGetVal(key));
 
-    /* Case 1: key already tracked — increment its access counter.
-     * Also track first empty slot we pass for potential insertion. */
-    empty_slot = -1;
+    /* Case 1: key already tracked — increment its access counter. */
+    empty_idx = -1;
     for (i = 0; i < s->size; i++) {
         if (!s->keys[i]) {
-            if (empty_slot == -1) empty_slot = i;
+            if (empty_idx == -1) empty_idx = i;
             continue;
         }
-        if (sdslen(s->keys[i]) == klen &&
+        if (s->dbs[i] == dbid &&
+            sdslen(s->keys[i]) == klen &&
             memcmp(s->keys[i], k, klen) == 0) {
             s->counters[i]++;
             return;
@@ -137,13 +143,17 @@ static void hotkeyMGSummaryAdd(hotkeyMGSummary *s, robj *key) {
         s->keys[s->size] = sdsnewlen(k, klen);
         s->counters[s->size] = 1;
         s->decrements[s->size] = 0;
+        s->dbs[s->size] = dbid;
+        s->slots[s->size] = slot;
         s->size++;
         return;
     }
-    if (empty_slot != -1) {
-        s->keys[empty_slot] = sdsnewlen(k, klen);
-        s->counters[empty_slot] = 1;
-        s->decrements[empty_slot] = 0;
+    if (empty_idx != -1) {
+        s->keys[empty_idx] = sdsnewlen(k, klen);
+        s->counters[empty_idx] = 1;
+        s->decrements[empty_idx] = 0;
+        s->dbs[empty_idx] = dbid;
+        s->slots[empty_idx] = slot;
         return;
     }
 
@@ -162,60 +172,45 @@ static void hotkeyMGSummaryAdd(hotkeyMGSummary *s, robj *key) {
  * ==========================================================================*/
 
 hotkeyManager *hotkeyManagerInit(int max_keys) {
-    hotkeyManager *m;
-
-    UNUSED(max_keys);
-    m = zcalloc(sizeof(hotkeyManager));
+    hotkeyManager *m = zcalloc(sizeof(hotkeyManager));
+    m->read_summary = hotkeyMGSummaryNew(max_keys);
+    m->write_summary = hotkeyMGSummaryNew(max_keys);
     return m;
 }
 
 void hotkeyManagerFree(hotkeyManager *m) {
-    int i;
-
     if (!m) return;
-    for (i = 0; i < HOTKEY_SLOTS; i++) {
-        if (m->read_summaries[i]) hotkeyMGSummaryFree(m->read_summaries[i]);
-        if (m->write_summaries[i]) hotkeyMGSummaryFree(m->write_summaries[i]);
-    }
+    if (m->read_summary) hotkeyMGSummaryFree(m->read_summary);
+    if (m->write_summary) hotkeyMGSummaryFree(m->write_summary);
     zfree(m);
 }
 
 void hotkeyManagerReset(hotkeyManager *m) {
-    int i;
-
     if (!m) return;
-    for (i = 0; i < HOTKEY_SLOTS; i++) {
-        if (m->read_summaries[i]) hotkeyMGSummaryReset(m->read_summaries[i]);
-        if (m->write_summaries[i]) hotkeyMGSummaryReset(m->write_summaries[i]);
-    }
+    if (m->read_summary) hotkeyMGSummaryReset(m->read_summary);
+    if (m->write_summary) hotkeyMGSummaryReset(m->write_summary);
 }
 
 /* ===========================================================================
  * Per-access detection hooks (called from lookupKey)
  * ==========================================================================*/
 
-void readHotKeyDetection(robj *key, int val_type, int slot) {
+void readHotKeyDetection(robj *key, int val_type, int slot, int dbid) {
     hotkeyManager *m = server.hotkey_manager;
 
     UNUSED(val_type);
     if (!m || !key) return;
-    if (slot < 0 || slot >= HOTKEY_SLOTS) return;
     server.hotkey_runtime_total_sampled++;
-    if (!m->read_summaries[slot])
-        m->read_summaries[slot] = hotkeyMGSummaryNew(server.hotkey_max_keys);
-    hotkeyMGSummaryAdd(m->read_summaries[slot], key);
+    hotkeyMGSummaryAdd(m->read_summary, key, dbid, slot);
 }
 
-void writeHotKeyDetection(robj *key, int val_type, int slot) {
+void writeHotKeyDetection(robj *key, int val_type, int slot, int dbid) {
     hotkeyManager *m = server.hotkey_manager;
 
     UNUSED(val_type);
     if (!m || !key) return;
-    if (slot < 0 || slot >= HOTKEY_SLOTS) return;
     server.hotkey_runtime_total_sampled++;
-    if (!m->write_summaries[slot])
-        m->write_summaries[slot] = hotkeyMGSummaryNew(server.hotkey_max_keys);
-    hotkeyMGSummaryAdd(m->write_summaries[slot], key);
+    hotkeyMGSummaryAdd(m->write_summary, key, dbid, slot);
 }
 
 
@@ -229,6 +224,7 @@ typedef struct {
     uint64_t qps;
     int slot;
     int is_read;
+    int dbid;
 } hotkeyMGCollected;
 
 static int hotkeyMGCollectedCmp(const void *a, const void *b) {
@@ -246,10 +242,36 @@ static uint64_t hotkeyEstimateQPS(uint64_t count) {
     return (count * 100 / server.hotkey_sampling_ratio) / server.hotkey_window_seconds;
 }
 
+static int hotkeyCountActive(hotkeyMGSummary *s, int filter_slot) {
+    int count = 0, i;
+    if (!s) return 0;
+    for (i = 0; i < s->size; i++) {
+        if (!s->keys[i]) continue;
+        if (filter_slot != -1 && s->slots[i] != filter_slot) continue;
+        count++;
+    }
+    return count;
+}
+
+static int hotkeyCollectEntries(hotkeyMGSummary *s, hotkeyMGCollected *arr, int n, int is_read, int filter_slot) {
+    int i;
+    if (!s) return n;
+    for (i = 0; i < s->size; i++) {
+        if (!s->keys[i]) continue;
+        if (filter_slot != -1 && s->slots[i] != filter_slot) continue;
+        arr[n].key = s->keys[i];
+        arr[n].qps = hotkeyEstimateQPS(s->counters[i]);
+        arr[n].slot = s->slots[i];
+        arr[n].is_read = is_read;
+        arr[n].dbid = s->dbs[i];
+        n++;
+    }
+    return n;
+}
+
 void hotkeysGetCommand(client *c) {
-    int filter_type, filter_slot, slot, i, n, limit;
+    int filter_type, filter_slot, i, n, limit;
     hotkeyManager *m;
-    hotkeyMGSummary *s;
     hotkeyMGCollected *collected;
     int count;
 
@@ -264,25 +286,11 @@ void hotkeysGetCommand(client *c) {
     }
     if (!parseHotkeyFilterArgs(c, 2, &filter_type, &filter_slot)) return;
 
-    /* First pass: count active entries to allocate exactly. */
     count = 0;
-    for (slot = 0; slot < HOTKEY_SLOTS; slot++) {
-        if (filter_slot != -1 && slot != filter_slot) continue;
-        if (filter_type == -1 || filter_type == 1) {
-            s = m->read_summaries[slot];
-            if (s) {
-                for (i = 0; i < s->size; i++)
-                    if (s->keys[i]) count++;
-            }
-        }
-        if (filter_type == -1 || filter_type == 0) {
-            s = m->write_summaries[slot];
-            if (s) {
-                for (i = 0; i < s->size; i++)
-                    if (s->keys[i]) count++;
-            }
-        }
-    }
+    if (filter_type == -1 || filter_type == 1)
+        count += hotkeyCountActive(m->read_summary, filter_slot);
+    if (filter_type == -1 || filter_type == 0)
+        count += hotkeyCountActive(m->write_summary, filter_slot);
 
     if (count == 0) {
         addReplyArrayLen(c, 0);
@@ -291,51 +299,23 @@ void hotkeysGetCommand(client *c) {
 
     collected = zmalloc(count * sizeof(hotkeyMGCollected));
     n = 0;
+    if (filter_type == -1 || filter_type == 1)
+        n = hotkeyCollectEntries(m->read_summary, collected, n, 1, filter_slot);
+    if (filter_type == -1 || filter_type == 0)
+        n = hotkeyCollectEntries(m->write_summary, collected, n, 0, filter_slot);
 
-    for (slot = 0; slot < HOTKEY_SLOTS; slot++) {
-        if (filter_slot != -1 && slot != filter_slot) continue;
-
-        if (filter_type == -1 || filter_type == 1) {
-            s = m->read_summaries[slot];
-            if (s) {
-                for (i = 0; i < s->size; i++) {
-                    if (!s->keys[i]) continue;
-                    collected[n].key = s->keys[i];
-                    collected[n].qps = hotkeyEstimateQPS(s->counters[i]);
-                    collected[n].slot = slot;
-                    collected[n].is_read = 1;
-                    n++;
-                }
-            }
-        }
-
-        if (filter_type == -1 || filter_type == 0) {
-            s = m->write_summaries[slot];
-            if (s) {
-                for (i = 0; i < s->size; i++) {
-                    if (!s->keys[i]) continue;
-                    collected[n].key = s->keys[i];
-                    collected[n].qps = hotkeyEstimateQPS(s->counters[i]);
-                    collected[n].slot = slot;
-                    collected[n].is_read = 0;
-                    n++;
-                }
-            }
-        }
-    }
-
-    /* Sort by QPS descending. */
     if (n > 0) qsort(collected, n, sizeof(hotkeyMGCollected), hotkeyMGCollectedCmp);
 
-    /* Return top K results. */
     limit = n < server.hotkey_max_keys ? n : server.hotkey_max_keys;
     addReplyArrayLen(c, limit);
     for (i = 0; i < limit; i++) {
-        addReplyArrayLen(c, 8);
+        addReplyArrayLen(c, 10);
         addReplyBulkCString(c, "key");
         addReplyBulkCBuffer(c, collected[i].key, sdslen(collected[i].key));
         addReplyBulkCString(c, "type");
         addReplyBulkCString(c, collected[i].is_read ? "read" : "write");
+        addReplyBulkCString(c, "db");
+        addReplyLongLong(c, collected[i].dbid);
         addReplyBulkCString(c, "slot");
         addReplyLongLong(c, collected[i].slot);
         addReplyBulkCString(c, "qps");
@@ -425,38 +405,76 @@ int hotKeyMaxKeysCallback(const char **err) {
 }
 
 /* ===========================================================================
- * Slot purge (triggered on cluster slot migration / flush / reset)
+ * Invalidation (slot purge, flush, key deletion)
  * ==========================================================================*/
+
+/* Invalidate entries matching a specific slot in a summary. */
+static void hotkeyMGSummaryInvalidateSlot(hotkeyMGSummary *s, int slot) {
+    int i;
+    if (!s) return;
+    for (i = 0; i < s->size; i++) {
+        if (s->keys[i] && s->slots[i] == slot) {
+            sdsfree(s->keys[i]);
+            s->keys[i] = NULL;
+        }
+    }
+}
+
+/* Invalidate a specific key+db combination in a summary. */
+static void hotkeyMGSummaryInvalidateKey(hotkeyMGSummary *s, const char *k, size_t klen, int dbid) {
+    int i;
+    if (!s) return;
+    for (i = 0; i < s->size; i++) {
+        if (s->keys[i] && s->dbs[i] == dbid &&
+            sdslen(s->keys[i]) == klen &&
+            memcmp(s->keys[i], k, klen) == 0) {
+            sdsfree(s->keys[i]);
+            s->keys[i] = NULL;
+            return;
+        }
+    }
+}
 
 void hotkeyPurgeSlot(int slot) {
     hotkeyManager *m = server.hotkey_manager;
-
     if (!m) return;
-
-    if (m->read_summaries[slot]) {
-        hotkeyMGSummaryFree(m->read_summaries[slot]);
-        m->read_summaries[slot] = NULL;
-    }
-    if (m->write_summaries[slot]) {
-        hotkeyMGSummaryFree(m->write_summaries[slot]);
-        m->write_summaries[slot] = NULL;
-    }
+    hotkeyMGSummaryInvalidateSlot(m->read_summary, slot);
+    hotkeyMGSummaryInvalidateSlot(m->write_summary, slot);
 }
 
 void hotkeyPurgeAll(void) {
     hotkeyManager *m = server.hotkey_manager;
-    int i;
-
     if (!m) return;
+    hotkeyMGSummaryReset(m->read_summary);
+    hotkeyMGSummaryReset(m->write_summary);
+}
 
-    for (i = 0; i < HOTKEY_SLOTS; i++) {
-        if (m->read_summaries[i]) {
-            hotkeyMGSummaryFree(m->read_summaries[i]);
-            m->read_summaries[i] = NULL;
-        }
-        if (m->write_summaries[i]) {
-            hotkeyMGSummaryFree(m->write_summaries[i]);
-            m->write_summaries[i] = NULL;
+static void hotkeyMGSummaryInvalidateDb(hotkeyMGSummary *s, int dbid) {
+    int i;
+    if (!s) return;
+    for (i = 0; i < s->size; i++) {
+        if (s->keys[i] && s->dbs[i] == dbid) {
+            sdsfree(s->keys[i]);
+            s->keys[i] = NULL;
         }
     }
+}
+
+void hotkeyPurgeDb(int dbid) {
+    hotkeyManager *m = server.hotkey_manager;
+    if (!m) return;
+    hotkeyMGSummaryInvalidateDb(m->read_summary, dbid);
+    hotkeyMGSummaryInvalidateDb(m->write_summary, dbid);
+}
+
+void hotkeyInvalidateKey(robj *key, int dbid) {
+    hotkeyManager *m = server.hotkey_manager;
+    const char *k;
+    size_t klen;
+
+    if (!m || !key || !objectGetVal(key)) return;
+    k = objectGetVal(key);
+    klen = sdslen(objectGetVal(key));
+    hotkeyMGSummaryInvalidateKey(m->read_summary, k, klen, dbid);
+    hotkeyMGSummaryInvalidateKey(m->write_summary, k, klen, dbid);
 }

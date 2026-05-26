@@ -128,9 +128,9 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
         int obj_type = val ? val->type : OBJ_STRING;
         int hotkey_slot = server.cluster_enabled ? keyHashSlot(objectGetVal(key), stringObjectLen(key)) : 0;
         if (flags & LOOKUP_WRITE) {
-            writeHotKeyDetection(key, obj_type, hotkey_slot);
+            writeHotKeyDetection(key, obj_type, hotkey_slot, db->id);
         } else {
-            readHotKeyDetection(key, obj_type, hotkey_slot);
+            readHotKeyDetection(key, obj_type, hotkey_slot, db->id);
         }
     }
 
@@ -488,6 +488,7 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
     hashtablePosition pos;
     void **ref = kvstoreHashtableTwoPhasePopFindRef(db->keys, dict_index, objectGetVal(key), &pos);
     if (ref != NULL) {
+        if (server.hotkey_enabled) hotkeyInvalidateKey(key, db->id);
         robj *val = *ref;
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we
          * need to incr to retain val */
@@ -694,8 +695,12 @@ long long emptyData(int dbnum, int flags, void(callback)(hashtable *)) {
     /* Empty the database structure. */
     removed = emptyDbStructure(server.db, dbnum, async, callback);
 
-    /* Purge all hot key detection state since keys are gone. */
-    hotkeyPurgeAll();
+    if (server.hotkey_enabled) {
+        if (dbnum == -1)
+            hotkeyPurgeAll();
+        else
+            hotkeyPurgeDb(dbnum);
+    }
 
     if (dbnum == -1) flushReplicaKeysWithExpireList(async);
 

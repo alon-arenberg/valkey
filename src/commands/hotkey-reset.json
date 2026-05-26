@@ -1,7 +1,7 @@
 {
     "RESET": {
-        "summary": "Reset all hot key statistics and history",
-        "complexity": "O(N) where N is the number of keys to remove from history and statistics",
+        "summary": "Reset all hot key detection state",
+        "complexity": "O(K) where K is the max tracked keys per summary",
         "group": "server",
         "since": "9.0.0",
         "arity": 2,
