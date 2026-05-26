@@ -1,6 +1,7 @@
 start_server {tags {"hotkey"}} {
     test "Enable hotkey functionality" {
         r config set hotkey-enabled yes
+        r config set hotkey-window-seconds 60
         set hotkey_status [r config get hotkey-enabled]
         assert_equal [lindex $hotkey_status 1] "yes"
     }
@@ -182,7 +183,7 @@ start_server {tags {"hotkey"}} {
         # Restore defaults for subsequent tests
         r config set hotkey-sampling-ratio 100
         r config set hotkey-max-keys 16
-        r config set hotkey-window-seconds 1
+        r config set hotkey-window-seconds 60
     }
 
     test "Disable hotkey functionality" {
@@ -375,18 +376,17 @@ start_server {tags {"hotkey"}} {
         r hotkeys reset
         r config set hotkey-sampling-ratio 100
         r config set hotkey-max-keys 16
-        r config set hotkey-window-seconds 1
 
         r set "qps_key" "val"
-        for {set i 0} {$i < 1000} {incr i} { r get "qps_key" }
+        for {set i 0} {$i < 1200} {incr i} { r get "qps_key" }
 
         set hotkeys [r hotkeys get TYPE read]
         assert {[llength $hotkeys] > 0}
         set first [lindex $hotkeys 0]
         assert_equal [lindex $first 1] "qps_key"
-        # With 100% sampling and 1s window, qps = count
+        # With 100% sampling and 60s window: qps = 1200 * 100/100 / 60 = 20
         set qps [lindex $first 9]
-        assert {$qps == 1000}
+        assert_equal $qps 20
     }
 
     test "Max-keys tracks the hottest keys" {
