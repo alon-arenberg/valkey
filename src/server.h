@@ -195,16 +195,17 @@ struct ValkeyModule;
 /* Instantaneous metrics tracking. */
 #define STATS_METRIC_SAMPLES 16 /* Number of samples per metric. */
 typedef enum {
-    STATS_METRIC_COMMAND = 0,             /* Number of commands executed. */
-    STATS_METRIC_NET_INPUT,               /* Bytes read from network. */
-    STATS_METRIC_NET_OUTPUT,              /* Bytes written to network. */
-    STATS_METRIC_NET_INPUT_REPLICATION,   /* Bytes read from network during replication. */
-    STATS_METRIC_NET_OUTPUT_REPLICATION,  /* Bytes written to network during replication. */
-    STATS_METRIC_EL_CYCLE,                /* Number of eventloop cycled. */
-    STATS_METRIC_EL_DURATION,             /* Eventloop duration. */
-    STATS_METRIC_IO_WAIT,                 /* IO queue size */
-    STATS_METRIC_MAIN_THREAD_ACTIVE_TIME, /* Main-thread active time */
-    STATS_METRIC_COUNT                    /* Total count */
+    STATS_METRIC_COMMAND = 0,            /* Number of commands executed. */
+    STATS_METRIC_NET_INPUT,              /* Bytes read from network. */
+    STATS_METRIC_NET_OUTPUT,             /* Bytes written to network. */
+    STATS_METRIC_NET_INPUT_REPLICATION,  /* Bytes read from network during replication. */
+    STATS_METRIC_NET_OUTPUT_REPLICATION, /* Bytes written to network during replication. */
+    STATS_METRIC_EL_CYCLE,               /* Number of eventloop cycled. */
+    STATS_METRIC_EL_DURATION,            /* Eventloop duration. */
+    STATS_METRIC_IO_WAIT,                /* IO queue size */
+    STATS_METRIC_MAIN_THREAD_CPU_SYS,    /* Main thread CPU sys time */
+    STATS_METRIC_MAIN_THREAD_CPU_USER,   /* Main thread CPU user time */
+    STATS_METRIC_COUNT                   /* Total count */
 } instantaneous_metric_type;
 
 /* Protocol and I/O related defines */
@@ -3915,7 +3916,7 @@ void signalKeyAsReady(serverDb *db, robj *key, int type);
 void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeout, int unblock_on_nokey);
 void blockClientShutdown(client *c);
 void blockPostponeClient(client *c);
-void blockClientForReplicaAck(client *c, mstime_t timeout, long long offset, long numreplicas, int numlocal);
+void blockClientForReplicaAck(client *c, mstime_t timeout, long long offset, int numreplicas, int numlocal);
 void replicationRequestAckFromReplicas(void);
 void signalDeletedKeyAsReady(serverDb *db, robj *key, int type);
 void updateStatsOnUnblock(client *c, long blocked_us, long reply_us, int failed_or_rejected);
