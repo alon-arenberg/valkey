@@ -64,6 +64,7 @@ static int parseHotkeyFilterArgs(client *c, int start_idx, int *filter_type, int
 hotkeyMGSummary *hotkeyMGSummaryNew(int max_keys) {
     hotkeyMGSummary *s = zcalloc(sizeof(hotkeyMGSummary));
     s->keys = zcalloc(max_keys * sizeof(sds));
+    s->key_lens = zcalloc(max_keys * sizeof(uint32_t));
     s->counters = zcalloc(max_keys * sizeof(uint64_t));
     s->decrements = zcalloc(max_keys * sizeof(uint64_t));
     s->dbs = zcalloc(max_keys * sizeof(int));
@@ -82,6 +83,7 @@ void hotkeyMGSummaryFree(hotkeyMGSummary *s) {
         if (s->keys[i]) sdsfree(s->keys[i]);
     }
     zfree(s->keys);
+    zfree(s->key_lens);
     zfree(s->counters);
     zfree(s->decrements);
     zfree(s->dbs);
@@ -96,6 +98,7 @@ static void hotkeyMGSummaryReset(hotkeyMGSummary *s) {
     for (i = 0; i < s->size; i++) {
         if (s->keys[i]) sdsfree(s->keys[i]);
         s->keys[i] = NULL;
+        s->key_lens[i] = 0;
         s->counters[i] = 0;
         s->decrements[i] = 0;
         s->dbs[i] = 0;
@@ -114,25 +117,33 @@ static void hotkeyMGSummaryReset(hotkeyMGSummary *s) {
  *    counters[i] - decrements[i] == 0. */
 static void hotkeyMGSummaryAdd(hotkeyMGSummary *s, robj *key, int dbid, int slot) {
     const char *k;
-    size_t klen;
+    uint32_t klen;
     int i, empty_idx;
 
     if (!s || !key || !objectGetVal(key)) return;
 
     s->total++;
     k = objectGetVal(key);
-    klen = sdslen(objectGetVal(key));
+    klen = (uint32_t)sdslen(objectGetVal(key));
 
-    /* Case 1: key already tracked — increment its access counter. */
+    /* Prefetch only keys that pass the fast-reject (matching length + db)
+     * so we don't waste cache lines on entries we'll skip. */
+    for (i = 0; i < s->size; i++) {
+        if (s->keys[i] && s->key_lens[i] == klen && s->dbs[i] == dbid)
+            valkey_prefetch(s->keys[i]);
+    }
+
+    /* Case 1: key already tracked — increment its access counter.
+     * Uses cached key_lens for fast-reject to avoid unnecessary memcmp. */
     empty_idx = -1;
     for (i = 0; i < s->size; i++) {
         if (!s->keys[i]) {
             if (empty_idx == -1) empty_idx = i;
             continue;
         }
-        if (s->dbs[i] == dbid &&
-            sdslen(s->keys[i]) == klen &&
-            memcmp(s->keys[i], k, klen) == 0) {
+        /* Fast-reject: check cached length and db before memcmp. */
+        if (s->key_lens[i] != klen || s->dbs[i] != dbid) continue;
+        if (memcmp(s->keys[i], k, klen) == 0) {
             s->counters[i]++;
             return;
         }
@@ -141,6 +152,7 @@ static void hotkeyMGSummaryAdd(hotkeyMGSummary *s, robj *key, int dbid, int slot
     /* Case 2: empty slot available. */
     if (s->size < s->max_keys) {
         s->keys[s->size] = sdsnewlen(k, klen);
+        s->key_lens[s->size] = klen;
         s->counters[s->size] = 1;
         s->decrements[s->size] = 0;
         s->dbs[s->size] = dbid;
@@ -150,6 +162,7 @@ static void hotkeyMGSummaryAdd(hotkeyMGSummary *s, robj *key, int dbid, int slot
     }
     if (empty_idx != -1) {
         s->keys[empty_idx] = sdsnewlen(k, klen);
+        s->key_lens[empty_idx] = klen;
         s->counters[empty_idx] = 1;
         s->decrements[empty_idx] = 0;
         s->dbs[empty_idx] = dbid;

@@ -1731,6 +1731,7 @@ typedef struct {
 /* Misra-Gries summary: parallel arrays of at most max_keys entries */
 typedef struct {
     sds *keys;            /* Key names (NULL = empty slot) */
+    uint32_t *key_lens;   /* Cached key lengths for fast-reject */
     uint64_t *counters;   /* Access count for key at position [i] */
     uint64_t *decrements; /* Decrement count for key at position [i] */
     int *dbs;             /* Database id for key at position [i] */
