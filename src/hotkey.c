@@ -16,13 +16,12 @@
  * Command argument parsing helpers
  * ==========================================================================*/
 
-/* Parse [SLOT <n>] [TYPE {read|write|all}] arguments in any order.
+/* Parse [TYPE {read|write|all}] argument.
  * Returns 1 on success, 0 on error (error reply already sent). */
-static int parseHotkeyFilterArgs(client *c, int start_idx, int *filter_type, int *filter_slot) {
+static int parseHotkeyFilterArgs(client *c, int start_idx, int *filter_type) {
     int i = start_idx;
 
     *filter_type = -1;
-    *filter_slot = -1;
 
     while (i < c->argc) {
         if (!strcasecmp(objectGetVal(c->argv[i]), "TYPE") && i + 1 < c->argc) {
@@ -38,18 +37,8 @@ static int parseHotkeyFilterArgs(client *c, int start_idx, int *filter_type, int
                 return 0;
             }
             i += 2;
-        } else if (!strcasecmp(objectGetVal(c->argv[i]), "SLOT") && i + 1 < c->argc) {
-            long long slot;
-            if (getLongLongFromObject(c->argv[i + 1], &slot) != C_OK ||
-                slot < 0 || slot >= HOTKEY_SLOTS) {
-                addReplyErrorFormat(c, "Invalid slot number. Must be 0-%d",
-                                    HOTKEY_SLOTS - 1);
-                return 0;
-            }
-            *filter_slot = (int)slot;
-            i += 2;
         } else {
-            addReplyError(c, "Syntax error. Use [SLOT <n>] [TYPE {read|write|all}]");
+            addReplyError(c, "Syntax error. Use [TYPE {read|write|all}]");
             return 0;
         }
     }
@@ -255,23 +244,20 @@ static uint64_t hotkeyEstimateQPS(uint64_t count) {
     return (count * 100 / server.hotkey_sampling_ratio) / server.hotkey_window_seconds;
 }
 
-static int hotkeyCountActive(hotkeyMGSummary *s, int filter_slot) {
+static int hotkeyCountActive(hotkeyMGSummary *s) {
     int count = 0, i;
     if (!s) return 0;
     for (i = 0; i < s->size; i++) {
-        if (!s->keys[i]) continue;
-        if (filter_slot != -1 && s->slots[i] != filter_slot) continue;
-        count++;
+        if (s->keys[i]) count++;
     }
     return count;
 }
 
-static int hotkeyCollectEntries(hotkeyMGSummary *s, hotkeyMGCollected *arr, int n, int is_read, int filter_slot) {
+static int hotkeyCollectEntries(hotkeyMGSummary *s, hotkeyMGCollected *arr, int n, int is_read) {
     int i;
     if (!s) return n;
     for (i = 0; i < s->size; i++) {
         if (!s->keys[i]) continue;
-        if (filter_slot != -1 && s->slots[i] != filter_slot) continue;
         arr[n].key = s->keys[i];
         arr[n].qps = hotkeyEstimateQPS(s->counters[i]);
         arr[n].slot = s->slots[i];
@@ -283,7 +269,7 @@ static int hotkeyCollectEntries(hotkeyMGSummary *s, hotkeyMGCollected *arr, int 
 }
 
 void hotkeysGetCommand(client *c) {
-    int filter_type, filter_slot, i, n, limit;
+    int filter_type, i, n, limit;
     hotkeyManager *m;
     hotkeyMGCollected *collected;
     int count;
@@ -297,13 +283,13 @@ void hotkeysGetCommand(client *c) {
         addReplyArrayLen(c, 0);
         return;
     }
-    if (!parseHotkeyFilterArgs(c, 2, &filter_type, &filter_slot)) return;
+    if (!parseHotkeyFilterArgs(c, 2, &filter_type)) return;
 
     count = 0;
     if (filter_type == -1 || filter_type == 1)
-        count += hotkeyCountActive(m->read_summary, filter_slot);
+        count += hotkeyCountActive(m->read_summary);
     if (filter_type == -1 || filter_type == 0)
-        count += hotkeyCountActive(m->write_summary, filter_slot);
+        count += hotkeyCountActive(m->write_summary);
 
     if (count == 0) {
         addReplyArrayLen(c, 0);
@@ -313,9 +299,9 @@ void hotkeysGetCommand(client *c) {
     collected = zmalloc(count * sizeof(hotkeyMGCollected));
     n = 0;
     if (filter_type == -1 || filter_type == 1)
-        n = hotkeyCollectEntries(m->read_summary, collected, n, 1, filter_slot);
+        n = hotkeyCollectEntries(m->read_summary, collected, n, 1);
     if (filter_type == -1 || filter_type == 0)
-        n = hotkeyCollectEntries(m->write_summary, collected, n, 0, filter_slot);
+        n = hotkeyCollectEntries(m->write_summary, collected, n, 0);
 
     if (n > 0) qsort(collected, n, sizeof(hotkeyMGCollected), hotkeyMGCollectedCmp);
 
@@ -348,27 +334,6 @@ void hotkeysResetCommand(client *c) {
     addReply(c, shared.ok);
 }
 
-void hotkeysPurgeCommand(client *c) {
-    long long slot;
-
-    if (!server.hotkey_enabled) {
-        addReplyError(c, "Hotkey detection is disabled");
-        return;
-    }
-    if (c->argc != 4 || strcasecmp(objectGetVal(c->argv[2]), "SLOT")) {
-        addReplyError(c, "Syntax error. Usage: HOTKEYS PURGE SLOT <slot>");
-        return;
-    }
-    if (getLongLongFromObject(c->argv[3], &slot) != C_OK ||
-        slot < 0 || slot >= HOTKEY_SLOTS) {
-        addReplyErrorFormat(c, "Invalid slot number. Must be 0-%d",
-                            HOTKEY_SLOTS - 1);
-        return;
-    }
-    hotkeyPurgeSlot((int)slot);
-    addReply(c, shared.ok);
-}
-
 /* HOTKEYS command dispatcher. */
 void hotkeysCommand(client *c) {
     char *subcmd;
@@ -382,8 +347,6 @@ void hotkeysCommand(client *c) {
         hotkeysGetCommand(c);
     else if (!strcasecmp(subcmd, "reset"))
         hotkeysResetCommand(c);
-    else if (!strcasecmp(subcmd, "purge"))
-        hotkeysPurgeCommand(c);
     else
         addReplyErrorFormat(c, "Unknown HOTKEYS subcommand '%s'", subcmd);
 }

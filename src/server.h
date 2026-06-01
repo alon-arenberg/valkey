@@ -4257,7 +4257,6 @@ void failoverCommand(client *c);
 void hotkeysCommand(client *c);
 void hotkeysGetCommand(client *c);
 void hotkeysResetCommand(client *c);
-void hotkeysPurgeCommand(client *c);
 
 /* Hotkey (Misra-Gries) */
 int hotKeyEnabledCallback(const char **err);

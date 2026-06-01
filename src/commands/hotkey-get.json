@@ -19,12 +19,6 @@
         "container": "HOTKEYS",
         "arguments": [
             {
-                "name": "slot",
-                "type": "integer",
-                "token": "SLOT",
-                "optional": true
-            },
-            {
                 "name": "type",
                 "type": "oneof",
                 "token": "TYPE",

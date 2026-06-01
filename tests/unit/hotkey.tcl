@@ -67,64 +67,6 @@ start_server {tags {"hotkey"}} {
         }
     }
 
-    test "HOTKEYS GET with SLOT filter" {
-        r hotkeys reset
-        r config set hotkey-sampling-ratio 100
-        r config set hotkey-max-keys 16
-
-        r set "slot_filter_key" "val"
-        for {set i 0} {$i < 500} {incr i} { r get "slot_filter_key" }
-
-        set all_hotkeys [r hotkeys get]
-        assert {[llength $all_hotkeys] > 0}
-        set first [lindex $all_hotkeys 0]
-        set slot_val [lindex $first 7]
-
-        set slot_hotkeys [r hotkeys get SLOT $slot_val]
-        assert {[llength $slot_hotkeys] > 0}
-        foreach entry $slot_hotkeys {
-            assert_equal [lindex $entry 7] $slot_val
-        }
-
-        # Filter by a different slot — should return nothing
-        set other_slot [expr {($slot_val + 1) % 16384}]
-        set other_hotkeys [r hotkeys get SLOT $other_slot]
-        assert_equal [llength $other_hotkeys] 0
-    }
-
-    test "HOTKEYS GET with SLOT and TYPE combined" {
-        r hotkeys reset
-        r config set hotkey-sampling-ratio 100
-        r config set hotkey-max-keys 16
-
-        r set "combined_filter_key" "val"
-        for {set i 0} {$i < 500} {incr i} {
-            r get "combined_filter_key"
-            r set "combined_filter_key" "val_$i"
-        }
-
-        set all_hotkeys [r hotkeys get]
-        assert {[llength $all_hotkeys] >= 2}
-
-        set first [lindex $all_hotkeys 0]
-        set slot_val [lindex $first 7]
-
-        set filtered [r hotkeys get SLOT $slot_val TYPE read]
-        foreach entry $filtered {
-            assert_equal [lindex $entry 3] "read"
-            assert_equal [lindex $entry 7] $slot_val
-        }
-
-        set filtered2 [r hotkeys get TYPE write SLOT $slot_val]
-        foreach entry $filtered2 {
-            assert_equal [lindex $entry 3] "write"
-            assert_equal [lindex $entry 7] $slot_val
-        }
-
-        set slot_all [r hotkeys get SLOT $slot_val]
-        assert_equal [llength $slot_all] [expr {[llength $filtered] + [llength $filtered2]}]
-    }
-
     test "HOTKEYS RESET clears all statistics" {
         set reset_result [r hotkeys reset]
         assert_equal $reset_result "OK"
@@ -164,10 +106,6 @@ start_server {tags {"hotkey"}} {
         assert_match "*Syntax error*" $err
         catch {r hotkeys} err
         assert_match "*wrong number of arguments*" $err
-        catch {r hotkeys get SLOT -1} err
-        assert_match "*Invalid slot*" $err
-        catch {r hotkeys get SLOT 16384} err
-        assert_match "*Invalid slot*" $err
     }
 
     test "Hotkey configuration parameters" {

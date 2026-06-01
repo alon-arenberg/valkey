@@ -7833,30 +7833,7 @@ struct COMMAND_ARG HOTKEYS_GET_type_Subargs[] = {
 
 /* HOTKEYS GET argument table */
 struct COMMAND_ARG HOTKEYS_GET_Args[] = {
-{MAKE_ARG("slot",ARG_TYPE_INTEGER,-1,"SLOT",NULL,NULL,CMD_ARG_OPTIONAL,0,NULL)},
 {MAKE_ARG("type",ARG_TYPE_ONEOF,-1,"TYPE",NULL,NULL,CMD_ARG_OPTIONAL,3,NULL),.subargs=HOTKEYS_GET_type_Subargs},
-};
-
-/********** HOTKEYS PURGE ********************/
-
-#ifndef SKIP_CMD_HISTORY_TABLE
-/* HOTKEYS PURGE history */
-#define HOTKEYS_PURGE_History NULL
-#endif
-
-#ifndef SKIP_CMD_TIPS_TABLE
-/* HOTKEYS PURGE tips */
-#define HOTKEYS_PURGE_Tips NULL
-#endif
-
-#ifndef SKIP_CMD_KEY_SPECS_TABLE
-/* HOTKEYS PURGE key specs */
-#define HOTKEYS_PURGE_Keyspecs NULL
-#endif
-
-/* HOTKEYS PURGE argument table */
-struct COMMAND_ARG HOTKEYS_PURGE_Args[] = {
-{MAKE_ARG("slot",ARG_TYPE_INTEGER,-1,"SLOT",NULL,NULL,CMD_ARG_NONE,0,NULL)},
 };
 
 /********** HOTKEYS RESET ********************/
@@ -7878,8 +7855,7 @@ struct COMMAND_ARG HOTKEYS_PURGE_Args[] = {
 
 /* HOTKEYS command table */
 struct COMMAND_STRUCT HOTKEYS_Subcommands[] = {
-{MAKE_CMD("get","Get the hottest keys in the current detection window","O(N) where N is the number of tracked keys in the summary","9.0.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,HOTKEYS_GET_History,0,HOTKEYS_GET_Tips,0,hotkeysGetCommand,-2,CMD_ADMIN|CMD_LOADING|CMD_STALE,ACL_CATEGORY_ADMIN|ACL_CATEGORY_DANGEROUS|ACL_CATEGORY_SLOW,NULL,HOTKEYS_GET_Keyspecs,0,NULL,2),.args=HOTKEYS_GET_Args},
-{MAKE_CMD("purge","Purge hot key detection state for a specific slot","O(K) where K is the max tracked keys per summary","9.0.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,HOTKEYS_PURGE_History,0,HOTKEYS_PURGE_Tips,0,hotkeysPurgeCommand,4,CMD_ADMIN|CMD_LOADING|CMD_STALE,ACL_CATEGORY_ADMIN|ACL_CATEGORY_DANGEROUS|ACL_CATEGORY_SLOW,NULL,HOTKEYS_PURGE_Keyspecs,0,NULL,1),.args=HOTKEYS_PURGE_Args},
+{MAKE_CMD("get","Get the hottest keys in the current detection window","O(N) where N is the number of tracked keys in the summary","9.0.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,HOTKEYS_GET_History,0,HOTKEYS_GET_Tips,0,hotkeysGetCommand,-2,CMD_ADMIN|CMD_LOADING|CMD_STALE,ACL_CATEGORY_ADMIN|ACL_CATEGORY_DANGEROUS|ACL_CATEGORY_SLOW,NULL,HOTKEYS_GET_Keyspecs,0,NULL,1),.args=HOTKEYS_GET_Args},
 {MAKE_CMD("reset","Reset all hot key detection state","O(K) where K is the max tracked keys per summary","9.0.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,HOTKEYS_RESET_History,0,HOTKEYS_RESET_Tips,0,hotkeysResetCommand,2,CMD_ADMIN|CMD_LOADING|CMD_STALE,ACL_CATEGORY_ADMIN|ACL_CATEGORY_DANGEROUS|ACL_CATEGORY_SLOW,NULL,HOTKEYS_RESET_Keyspecs,0,NULL,0)},
 {0}
 };
