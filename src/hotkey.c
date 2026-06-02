@@ -149,10 +149,11 @@ static void heapSiftDown(hotkeyTopK *tk, int idx) {
     }
 }
 
-/* Find key index in heap by linear scan. Returns -1 if not found. */
-static int hotkeyTopKFind(hotkeyTopK *tk, const char *k, size_t klen) {
+/* Find (key, dbid) index in heap by linear scan. Returns -1 if not found. */
+static int hotkeyTopKFind(hotkeyTopK *tk, const char *k, size_t klen, int dbid) {
     for (int i = 0; i < tk->size; i++) {
         if (tk->entries[i].key &&
+            tk->entries[i].dbid == dbid &&
             sdslen(tk->entries[i].key) == klen &&
             memcmp(tk->entries[i].key, k, klen) == 0) {
             return i;
@@ -161,15 +162,16 @@ static int hotkeyTopKFind(hotkeyTopK *tk, const char *k, size_t klen) {
     return -1;
 }
 
-static void hotkeyTopKAdd(hotkeyTopK *tk, robj *key, uint64_t count, int val_type) {
+static void hotkeyTopKAdd(hotkeyTopK *tk, robj *key, uint64_t count, int dbid, int slot) {
     sds k = objectGetVal(key);
     size_t klen = sdslen(k);
 
-    /* Key already in heap — update count and fix heap order */
-    int idx = hotkeyTopKFind(tk, k, klen);
+    /* (Key, dbid) already in heap — update count and fix heap order */
+    int idx = hotkeyTopKFind(tk, k, klen, dbid);
     if (idx >= 0) {
         tk->entries[idx].count = count;
-        tk->entries[idx].val_type = val_type;
+        tk->entries[idx].dbid = dbid;
+        tk->entries[idx].slot = slot;
         heapSiftDown(tk, idx);
         return;
     }
@@ -179,7 +181,8 @@ static void hotkeyTopKAdd(hotkeyTopK *tk, robj *key, uint64_t count, int val_typ
         idx = tk->size;
         tk->entries[idx].key = sdsnewlen(k, klen);
         tk->entries[idx].count = count;
-        tk->entries[idx].val_type = val_type;
+        tk->entries[idx].dbid = dbid;
+        tk->entries[idx].slot = slot;
         tk->size++;
         heapSiftUp(tk, idx);
         return;
@@ -190,39 +193,10 @@ static void hotkeyTopKAdd(hotkeyTopK *tk, robj *key, uint64_t count, int val_typ
         sdsfree(tk->entries[0].key);
         tk->entries[0].key = sdsnewlen(k, klen);
         tk->entries[0].count = count;
-        tk->entries[0].val_type = val_type;
+        tk->entries[0].dbid = dbid;
+        tk->entries[0].slot = slot;
         heapSiftDown(tk, 0);
     }
-}
-
-/* ===========================================================================
- * Per-slot state management
- * ==========================================================================*/
-
-static hotkeySlotState *hotkeySlotStateNew(void) {
-    hotkeySlotState *s = zcalloc(sizeof(hotkeySlotState));
-    s->read_cms = newHotkeyCMS(server.hotkey_cms_bucket_size, server.hotkey_cms_depth);
-    s->read_topk = hotkeyTopKNew(server.hotkey_top_k);
-    s->write_cms = newHotkeyCMS(server.hotkey_cms_bucket_size, server.hotkey_cms_depth);
-    s->write_topk = hotkeyTopKNew(server.hotkey_top_k);
-    return s;
-}
-
-static void hotkeySlotStateFree(hotkeySlotState *s) {
-    if (!s) return;
-    if (s->read_cms) freeHotkeyCMS(s->read_cms);
-    if (s->read_topk) hotkeyTopKFree(s->read_topk);
-    if (s->write_cms) freeHotkeyCMS(s->write_cms);
-    if (s->write_topk) hotkeyTopKFree(s->write_topk);
-    zfree(s);
-}
-
-static void hotkeySlotStateReset(hotkeySlotState *s) {
-    if (!s) return;
-    if (s->read_cms) hotkeyCMSReset(s->read_cms);
-    if (s->read_topk) hotkeyTopKReset(s->read_topk);
-    if (s->write_cms) hotkeyCMSReset(s->write_cms);
-    if (s->write_topk) hotkeyTopKReset(s->write_topk);
 }
 
 /* ===========================================================================
@@ -230,75 +204,55 @@ static void hotkeySlotStateReset(hotkeySlotState *s) {
  * ==========================================================================*/
 
 hotkeyManager *hotkeyManagerInit(size_t cms_width, size_t cms_depth) {
-    UNUSED(cms_width);
-    UNUSED(cms_depth);
     hotkeyManager *m = zcalloc(sizeof(hotkeyManager));
+    m->read_cms = newHotkeyCMS(cms_width, cms_depth);
+    m->read_topk = hotkeyTopKNew(server.hotkey_top_k);
+    m->write_cms = newHotkeyCMS(cms_width, cms_depth);
+    m->write_topk = hotkeyTopKNew(server.hotkey_top_k);
     return m;
 }
 
 void hotkeyManagerFree(hotkeyManager *m) {
     if (!m) return;
-    for (int i = 0; i < HOTKEY_SLOTS; i++) {
-        if (m->slots[i]) hotkeySlotStateFree(m->slots[i]);
-    }
+    if (m->read_cms) freeHotkeyCMS(m->read_cms);
+    if (m->read_topk) hotkeyTopKFree(m->read_topk);
+    if (m->write_cms) freeHotkeyCMS(m->write_cms);
+    if (m->write_topk) hotkeyTopKFree(m->write_topk);
     zfree(m);
 }
 
 void hotkeyManagerReset(hotkeyManager *m) {
     if (!m) return;
-    for (int i = 0; i < HOTKEY_SLOTS; i++) {
-        if (m->slots[i]) hotkeySlotStateReset(m->slots[i]);
-    }
-}
-
-void hotkeyPurgeSlot(int slot) {
-    hotkeyManager *m = server.hotkey_manager;
-    if (!m || slot < 0 || slot >= HOTKEY_SLOTS) return;
-    if (m->slots[slot]) {
-        hotkeySlotStateFree(m->slots[slot]);
-        m->slots[slot] = NULL;
-    }
+    if (m->read_cms) hotkeyCMSReset(m->read_cms);
+    if (m->read_topk) hotkeyTopKReset(m->read_topk);
+    if (m->write_cms) hotkeyCMSReset(m->write_cms);
+    if (m->write_topk) hotkeyTopKReset(m->write_topk);
 }
 
 void hotkeyPurgeAll(void) {
-    hotkeyManager *m = server.hotkey_manager;
-    if (!m) return;
-    for (int i = 0; i < HOTKEY_SLOTS; i++) {
-        if (m->slots[i]) {
-            hotkeySlotStateFree(m->slots[i]);
-            m->slots[i] = NULL;
-        }
-    }
+    hotkeyManagerReset(server.hotkey_manager);
 }
 
 /* ===========================================================================
  * Per-access detection hooks
  * ==========================================================================*/
 
-void readHotKeyDetection(robj *key, int val_type, int slot) {
+void readHotKeyDetection(robj *key, int slot, int dbid) {
     hotkeyManager *m = server.hotkey_manager;
     if (!m || !key) return;
-    if (slot < 0 || slot >= HOTKEY_SLOTS) return;
     server.hotkey_runtime_total_sampled++;
 
-    if (!m->slots[slot])
-        m->slots[slot] = hotkeySlotStateNew();
-
-    size_t count = hotkeyCMSUpdate(m->slots[slot]->read_cms, key);
-    hotkeyTopKAdd(m->slots[slot]->read_topk, key, count, val_type);
+    size_t count = hotkeyCMSUpdate(m->read_cms, key);
+    hotkeyTopKAdd(m->read_topk, key, count, dbid, slot);
 }
 
-void writeHotKeyDetection(robj *key, int val_type, int slot) {
+void writeHotKeyDetection(robj *key, int slot, int dbid) {
     hotkeyManager *m = server.hotkey_manager;
     if (!m || !key) return;
-    if (slot < 0 || slot >= HOTKEY_SLOTS) return;
     server.hotkey_runtime_total_sampled++;
 
-    if (!m->slots[slot])
-        m->slots[slot] = hotkeySlotStateNew();
-
-    size_t count = hotkeyCMSUpdate(m->slots[slot]->write_cms, key);
-    hotkeyTopKAdd(m->slots[slot]->write_topk, key, count, val_type);
+    size_t count = hotkeyCMSUpdate(m->write_cms, key);
+    hotkeyTopKAdd(m->write_topk, key, count, dbid, slot);
 }
 
 /* ===========================================================================
@@ -307,17 +261,39 @@ void writeHotKeyDetection(robj *key, int val_type, int slot) {
 
 typedef struct {
     sds key;
-    uint64_t count;
+    uint64_t qps;
     int is_read;
+    int dbid;
     int slot;
 } hotkeyCollected;
 
 static int hotkeyCollectedCmpDesc(const void *a, const void *b) {
     const hotkeyCollected *ea = a;
     const hotkeyCollected *eb = b;
-    if (eb->count > ea->count) return 1;
-    if (eb->count < ea->count) return -1;
+    if (eb->qps > ea->qps) return 1;
+    if (eb->qps < ea->qps) return -1;
     return 0;
+}
+
+/* Extrapolate QPS from sampled count:
+ * qps = count * (100 / sampling_ratio) / window_seconds */
+static uint64_t hotkeyEstimateQPS(uint64_t count) {
+    if (server.hotkey_sampling_ratio <= 0 || server.hotkey_window_seconds <= 0) return 0;
+    return (count * 100 / server.hotkey_sampling_ratio) / server.hotkey_window_seconds;
+}
+
+static int hotkeyCollectFromTopK(hotkeyTopK *tk, hotkeyCollected *arr, int n, int is_read) {
+    if (!tk) return n;
+    for (int j = 0; j < tk->size; j++) {
+        if (!tk->entries[j].key) continue;
+        arr[n].key = tk->entries[j].key;
+        arr[n].qps = hotkeyEstimateQPS(tk->entries[j].count);
+        arr[n].is_read = is_read;
+        arr[n].dbid = tk->entries[j].dbid;
+        arr[n].slot = tk->entries[j].slot;
+        n++;
+    }
+    return n;
 }
 
 void hotkeysGetCommand(client *c) {
@@ -332,7 +308,6 @@ void hotkeysGetCommand(client *c) {
     }
 
     int filter_type = -1;
-    int filter_slot = -1;
     int i = 2;
     while (i < c->argc) {
         if (!strcasecmp(objectGetVal(c->argv[i]), "TYPE") && i + 1 < c->argc) {
@@ -348,31 +323,16 @@ void hotkeysGetCommand(client *c) {
                 return;
             }
             i += 2;
-        } else if (!strcasecmp(objectGetVal(c->argv[i]), "SLOT") && i + 1 < c->argc) {
-            long long slot;
-            if (getLongLongFromObject(c->argv[i + 1], &slot) != C_OK ||
-                slot < 0 || slot >= HOTKEY_SLOTS) {
-                addReplyErrorFormat(c, "Invalid slot number. Must be 0-%d", HOTKEY_SLOTS - 1);
-                return;
-            }
-            filter_slot = (int)slot;
-            i += 2;
         } else {
-            addReplyError(c, "Syntax error. Usage: HOTKEYS GET [TYPE {read|write|all}] [SLOT <n>]");
+            addReplyError(c, "Syntax error. Usage: HOTKEYS GET [TYPE {read|write|all}]");
             return;
         }
     }
 
     /* Count total entries to allocate */
     int count = 0;
-    for (int s = 0; s < HOTKEY_SLOTS; s++) {
-        if (filter_slot != -1 && s != filter_slot) continue;
-        if (!m->slots[s]) continue;
-        if (filter_type != 0 && m->slots[s]->read_topk)
-            count += m->slots[s]->read_topk->size;
-        if (filter_type != 1 && m->slots[s]->write_topk)
-            count += m->slots[s]->write_topk->size;
-    }
+    if (filter_type != 0 && m->read_topk) count += m->read_topk->size;
+    if (filter_type != 1 && m->write_topk) count += m->write_topk->size;
 
     if (count == 0) {
         addReplyArrayLen(c, 0);
@@ -381,34 +341,8 @@ void hotkeysGetCommand(client *c) {
 
     hotkeyCollected *arr = zmalloc(count * sizeof(hotkeyCollected));
     int n = 0;
-
-    for (int s = 0; s < HOTKEY_SLOTS; s++) {
-        if (filter_slot != -1 && s != filter_slot) continue;
-        if (!m->slots[s]) continue;
-
-        if (filter_type != 0 && m->slots[s]->read_topk) {
-            hotkeyTopK *tk = m->slots[s]->read_topk;
-            for (int j = 0; j < tk->size; j++) {
-                if (!tk->entries[j].key) continue;
-                arr[n].key = tk->entries[j].key;
-                arr[n].count = tk->entries[j].count;
-                arr[n].is_read = 1;
-                arr[n].slot = s;
-                n++;
-            }
-        }
-        if (filter_type != 1 && m->slots[s]->write_topk) {
-            hotkeyTopK *tk = m->slots[s]->write_topk;
-            for (int j = 0; j < tk->size; j++) {
-                if (!tk->entries[j].key) continue;
-                arr[n].key = tk->entries[j].key;
-                arr[n].count = tk->entries[j].count;
-                arr[n].is_read = 0;
-                arr[n].slot = s;
-                n++;
-            }
-        }
-    }
+    if (filter_type != 0) n = hotkeyCollectFromTopK(m->read_topk, arr, n, 1);
+    if (filter_type != 1) n = hotkeyCollectFromTopK(m->write_topk, arr, n, 0);
 
     qsort(arr, n, sizeof(hotkeyCollected), hotkeyCollectedCmpDesc);
 
@@ -416,15 +350,17 @@ void hotkeysGetCommand(client *c) {
     int limit = n < server.hotkey_top_k ? n : server.hotkey_top_k;
     addReplyArrayLen(c, limit);
     for (int j = 0; j < limit; j++) {
-        addReplyArrayLen(c, 8);
+        addReplyArrayLen(c, 10);
         addReplyBulkCString(c, "key");
         addReplyBulkCBuffer(c, arr[j].key, sdslen(arr[j].key));
         addReplyBulkCString(c, "type");
         addReplyBulkCString(c, arr[j].is_read ? "read" : "write");
+        addReplyBulkCString(c, "db");
+        addReplyLongLong(c, arr[j].dbid);
         addReplyBulkCString(c, "slot");
         addReplyLongLong(c, arr[j].slot);
-        addReplyBulkCString(c, "count");
-        addReplyLongLong(c, arr[j].count);
+        addReplyBulkCString(c, "qps");
+        addReplyLongLong(c, arr[j].qps);
     }
     zfree(arr);
 }

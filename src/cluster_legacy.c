@@ -6493,7 +6493,6 @@ int clusterDelSlot(int slot) {
     /* Make owner_not_claiming_slot flag consistent with slot ownership information. */
     bitmapClearBit(server.cluster->owner_not_claiming_slot, slot);
     clusterSlotStatReset(slot);
-    hotkeyPurgeSlot(slot);
     return C_OK;
 }
 

@@ -1725,8 +1725,6 @@ typedef struct {
  * Hotkey definition
  *----------------------------------------------------------------------------*/
 
-#define HOTKEY_SLOTS 16384
-
 /* Count-Min Sketch structure definition */
 typedef struct {
     uint32_t width;      /* Number of buckets per hash function (must be power of 2) */
@@ -1740,7 +1738,8 @@ typedef struct {
 typedef struct {
     sds key;            /* Key name */
     uint64_t count;     /* CMS count estimate */
-    int val_type;       /* Value type (OBJ_TYPE_*) */
+    int dbid;           /* Database id */
+    int slot;           /* Hash slot (0 in standalone mode) */
 } hotkeyTopKEntry;
 
 /* Min-heap top-K tracker: root is smallest, linear key search for membership */
@@ -1750,17 +1749,12 @@ typedef struct {
     int size;                 /* Current entries */
 } hotkeyTopK;
 
-/* Per-slot hotkey state: CMS + top-K for read and write, lazily allocated */
+/* Hotkey manager: single global CMS + top-K per access type */
 typedef struct {
     hotkeyCMS *read_cms;
     hotkeyTopK *read_topk;
     hotkeyCMS *write_cms;
     hotkeyTopK *write_topk;
-} hotkeySlotState;
-
-/* Hotkey manager: per-slot state array */
-typedef struct {
-    hotkeySlotState *slots[HOTKEY_SLOTS]; /* Lazily allocated per slot */
 } hotkeyManager;
 
 /*-----------------------------------------------------------------------------
@@ -2438,6 +2432,7 @@ struct valkeyServer {
     int hotkey_cms_bucket_size;                      /* The size of the CMS bucket. */
     int hotkey_cms_depth;                            /* The depth of the CMS (number of hash functions). */
     int hotkey_top_k;                               /* Number of top keys to track per type in min-heap. */
+    int hotkey_window_seconds;                       /* Detection window length in seconds. */
     unsigned long long hotkey_runtime_total_sampled; /* Total number of sampled keys */
     hotkeyManager *hotkey_manager;
 };
@@ -4298,10 +4293,9 @@ void hotkeyCMSReset(hotkeyCMS *hotkey_cms);
 hotkeyManager *hotkeyManagerInit(size_t cms_width, size_t cms_depth);
 void hotkeyManagerFree(hotkeyManager *manager);
 void hotkeyManagerReset(hotkeyManager *manager);
-void hotkeyPurgeSlot(int slot);
 void hotkeyPurgeAll(void);
-void writeHotKeyDetection(robj *key, int val_type, int slot);
-void readHotKeyDetection(robj *key, int val_type, int slot);
+void writeHotKeyDetection(robj *key, int slot, int dbid);
+void readHotKeyDetection(robj *key, int slot, int dbid);
 
 /* Helper functions for getting database id args from argv, argc */
 int *selectDbIdArgs(robj **argv, int argc, int *count);
