@@ -216,30 +216,34 @@ start_server {tags {"hotkey"}} {
         assert_equal [lindex $first 5] 0
     }
 
-    test "Key deletion invalidates hotkey entry" {
+    test "Key deletion is counted as a write access" {
         r hotkeys reset
         r config set hotkey-sampling-ratio 100
         r config set hotkey-max-keys 16
 
-        r set "del_test_key" "val"
-        for {set i 0} {$i < 500} {incr i} { r get "del_test_key" }
-
-        set hotkeys_before [r hotkeys get TYPE read]
-        set found 0
-        foreach entry $hotkeys_before {
-            if {[lindex $entry 1] eq "del_test_key"} { set found 1 }
+        # Two scenarios: one with only SETs, one with SET+DEL pairs.
+        # The SET+DEL flow should produce ~2x the write count of pure SETs.
+        for {set i 0} {$i < 200} {incr i} {
+            r set "set_only_key" "val"
         }
-        assert_equal $found 1
-
-        # Delete the key
-        r del "del_test_key"
-
-        set hotkeys_after [r hotkeys get TYPE read]
-        set found 0
-        foreach entry $hotkeys_after {
-            if {[lindex $entry 1] eq "del_test_key"} { set found 1 }
+        for {set i 0} {$i < 100} {incr i} {
+            r set "set_del_key" "val"
+            r del "set_del_key"
         }
-        assert_equal $found 0
+
+        set writes [r hotkeys get TYPE write]
+        set set_only_qps 0
+        set set_del_qps 0
+        foreach entry $writes {
+            set name [lindex $entry 1]
+            if {$name eq "set_only_key"} { set set_only_qps [lindex $entry 9] }
+            if {$name eq "set_del_key"}  { set set_del_qps  [lindex $entry 9] }
+        }
+        # Both keys had 200 write operations (200 SETs vs 100 SET + 100 DEL).
+        # If DEL is counted as a write, QPS values should be roughly equal.
+        assert {$set_only_qps > 0}
+        assert {$set_del_qps > 0}
+        assert {$set_del_qps >= $set_only_qps - 1 && $set_del_qps <= $set_only_qps + 1}
     }
 
     test "FLUSHALL purges all hotkey state" {

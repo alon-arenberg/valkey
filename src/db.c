@@ -125,12 +125,11 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
     /* If the hot key detection function is enabled and the hot key sampling rate is reached,
      * hot key statistics will be performed. */
     if (server.hotkey_enabled && (rand() % 100) < server.hotkey_sampling_ratio) {
-        int obj_type = val ? val->type : OBJ_STRING;
         int hotkey_slot = server.cluster_enabled ? keyHashSlot(objectGetVal(key), stringObjectLen(key)) : 0;
         if (flags & LOOKUP_WRITE) {
-            writeHotKeyDetection(key, obj_type, hotkey_slot, db->id);
+            writeHotKeyDetection(key, hotkey_slot, db->id);
         } else {
-            readHotKeyDetection(key, obj_type, hotkey_slot, db->id);
+            readHotKeyDetection(key, hotkey_slot, db->id);
         }
     }
 
@@ -488,7 +487,11 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
     hashtablePosition pos;
     void **ref = kvstoreHashtableTwoPhasePopFindRef(db->keys, dict_index, objectGetVal(key), &pos);
     if (ref != NULL) {
-        if (server.hotkey_enabled) hotkeyInvalidateKey(key, db->id);
+        /* Treat key deletion/expiry as a write access for hot key detection. */
+        if (server.hotkey_enabled && (rand() % 100) < server.hotkey_sampling_ratio) {
+            int hotkey_slot = server.cluster_enabled ? keyHashSlot(objectGetVal(key), stringObjectLen(key)) : 0;
+            writeHotKeyDetection(key, hotkey_slot, db->id);
+        }
         robj *val = *ref;
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we
          * need to incr to retain val */

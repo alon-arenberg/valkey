@@ -197,19 +197,17 @@ void hotkeyManagerReset(hotkeyManager *m) {
  * Per-access detection hooks (called from lookupKey)
  * ==========================================================================*/
 
-void readHotKeyDetection(robj *key, int val_type, int slot, int dbid) {
+void readHotKeyDetection(robj *key, int slot, int dbid) {
     hotkeyManager *m = server.hotkey_manager;
 
-    UNUSED(val_type);
     if (!m || !key) return;
     server.hotkey_runtime_total_sampled++;
     hotkeyMGSummaryAdd(m->read_summary, key, dbid, slot);
 }
 
-void writeHotKeyDetection(robj *key, int val_type, int slot, int dbid) {
+void writeHotKeyDetection(robj *key, int slot, int dbid) {
     hotkeyManager *m = server.hotkey_manager;
 
-    UNUSED(val_type);
     if (!m || !key) return;
     server.hotkey_runtime_total_sampled++;
     hotkeyMGSummaryAdd(m->write_summary, key, dbid, slot);
@@ -454,3 +452,4 @@ void hotkeyInvalidateKey(robj *key, int dbid) {
     hotkeyMGSummaryInvalidateKey(m->read_summary, k, klen, dbid);
     hotkeyMGSummaryInvalidateKey(m->write_summary, k, klen, dbid);
 }
+
