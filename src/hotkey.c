@@ -1,132 +1,65 @@
 #include "server.h"
 
 /* ===========================================================================
- * Count-Min Sketch
- * ==========================================================================*/
-
-uint32_t murmurHash2(const void *key, int len, uint32_t seed) {
-    const uint32_t m = 0x5bd1e995;
-    const int r = 24;
-    uint32_t h = seed ^ len;
-    const unsigned char *data = (const unsigned char *)key;
-
-    while (len >= 4) {
-        uint32_t k = *(uint32_t *)data;
-        k *= m;
-        k ^= k >> r;
-        k *= m;
-        h *= m;
-        h ^= k;
-        data += 4;
-        len -= 4;
-    }
-    switch (len) {
-    case 3: h ^= data[2] << 16; /* fallthrough */
-    case 2: h ^= data[1] << 8; /* fallthrough */
-    case 1:
-        h ^= data[0];
-        h *= m;
-    };
-    h ^= h >> 13;
-    h *= m;
-    h ^= h >> 15;
-    return h;
-}
-
-static size_t nextPowerOfTwo(size_t n) {
-    if (n == 0) return 1;
-    if ((n & (n - 1)) == 0) return n;
-    size_t power = 1;
-    while (power < n) power <<= 1;
-    return power;
-}
-
-hotkeyCMS *newHotkeyCMS(size_t width, size_t depth) {
-    serverAssert(width > 0 && depth > 0);
-    hotkeyCMS *cms = zcalloc(sizeof(hotkeyCMS));
-    size_t adjusted_width = nextPowerOfTwo(width);
-    cms->width = adjusted_width;
-    cms->depth = depth;
-    cms->counter = 0;
-    cms->width_mask = adjusted_width - 1;
-    cms->array = zcalloc(adjusted_width * depth * sizeof(uint32_t));
-    return cms;
-}
-
-void freeHotkeyCMS(hotkeyCMS *cms) {
-    if (!cms) return;
-    if (cms->array) zfree(cms->array);
-    zfree(cms);
-}
-
-size_t hotkeyCMSUpdate(hotkeyCMS *cms, robj *key) {
-    if (!cms || !key || !objectGetVal(key)) return 0;
-    size_t len = stringObjectLen(key);
-    if (len == 0) return 0;
-
-    size_t minCount = (size_t)-1;
-    for (size_t i = 0; i < cms->depth; ++i) {
-        uint32_t hash = murmurHash2(objectGetVal(key), len, i);
-        size_t loc = (hash & cms->width_mask) + (i * cms->width);
-        cms->array[loc]++;
-        minCount = min(minCount, cms->array[loc]);
-    }
-    cms->counter++;
-    return minCount;
-}
-
-void hotkeyCMSReset(hotkeyCMS *cms) {
-    if (!cms || !cms->array) return;
-    memset(cms->array, 0, (size_t)cms->width * cms->depth * sizeof(uint32_t));
-    cms->counter = 0;
-}
-
-/* ===========================================================================
- * Top-K min-heap tracker
+ * Space-Saving algorithm for Top-K heavy hitters
  *
- * Min-ordered by count: root has the smallest count. When full and a new key
- * has a higher count than the root, evict the root. Linear scan for key
- * lookup (K is small), heap sift for structural maintenance.
+ * Reference: Metwally, Agrawal, El Abbadi (2005),
+ *   "Efficient Computation of Frequent and Top-k Elements in Data Streams".
+ *
+ * Maintains K (key, count, error) entries. Per observation:
+ *   1. If key already tracked: count++.
+ *   2. Else if room available (size < K): insert with count=1, error=0.
+ *   3. Else: replace the entry with the smallest count; new entry takes
+ *      count = min_count + 1, error = min_count.
+ *
+ * Guarantees:
+ *   - For any tracked key: true_count is in [count - error, count].
+ *   - Any key with true frequency f > N/K is guaranteed to be tracked.
+ *
+ * The structure is organized as a min-heap by `count` so the eviction
+ * candidate (root) is found in O(1). Membership check is a linear scan
+ * since K is small (default 16).
  * ==========================================================================*/
 
-static hotkeyTopK *hotkeyTopKNew(int capacity) {
-    hotkeyTopK *tk = zcalloc(sizeof(hotkeyTopK));
-    tk->entries = zcalloc(capacity * sizeof(hotkeyTopKEntry));
-    tk->capacity = capacity;
-    tk->size = 0;
-    return tk;
+static hotkeySS *hotkeySSNew(int capacity) {
+    hotkeySS *ss = zcalloc(sizeof(hotkeySS));
+    ss->entries = zcalloc(capacity * sizeof(hotkeySSEntry));
+    ss->capacity = capacity;
+    ss->size = 0;
+    return ss;
 }
 
-static void hotkeyTopKFree(hotkeyTopK *tk) {
-    if (!tk) return;
-    for (int i = 0; i < tk->size; i++) {
-        if (tk->entries[i].key) sdsfree(tk->entries[i].key);
+static void hotkeySSFree(hotkeySS *ss) {
+    if (!ss) return;
+    for (int i = 0; i < ss->size; i++) {
+        if (ss->entries[i].key) sdsfree(ss->entries[i].key);
     }
-    zfree(tk->entries);
-    zfree(tk);
+    zfree(ss->entries);
+    zfree(ss);
 }
 
-static void hotkeyTopKReset(hotkeyTopK *tk) {
-    if (!tk) return;
-    for (int i = 0; i < tk->size; i++) {
-        if (tk->entries[i].key) sdsfree(tk->entries[i].key);
-        tk->entries[i].key = NULL;
-        tk->entries[i].count = 0;
+static void hotkeySSReset(hotkeySS *ss) {
+    if (!ss) return;
+    for (int i = 0; i < ss->size; i++) {
+        if (ss->entries[i].key) sdsfree(ss->entries[i].key);
+        ss->entries[i].key = NULL;
+        ss->entries[i].count = 0;
+        ss->entries[i].error = 0;
     }
-    tk->size = 0;
+    ss->size = 0;
 }
 
-static void heapSwap(hotkeyTopK *tk, int a, int b) {
-    hotkeyTopKEntry tmp = tk->entries[a];
-    tk->entries[a] = tk->entries[b];
-    tk->entries[b] = tmp;
+static void heapSwap(hotkeySS *ss, int a, int b) {
+    hotkeySSEntry tmp = ss->entries[a];
+    ss->entries[a] = ss->entries[b];
+    ss->entries[b] = tmp;
 }
 
-static void heapSiftUp(hotkeyTopK *tk, int idx) {
+static void heapSiftUp(hotkeySS *ss, int idx) {
     while (idx > 0) {
         int parent = (idx - 1) / 2;
-        if (tk->entries[idx].count < tk->entries[parent].count) {
-            heapSwap(tk, idx, parent);
+        if (ss->entries[idx].count < ss->entries[parent].count) {
+            heapSwap(ss, idx, parent);
             idx = parent;
         } else {
             break;
@@ -134,99 +67,95 @@ static void heapSiftUp(hotkeyTopK *tk, int idx) {
     }
 }
 
-static void heapSiftDown(hotkeyTopK *tk, int idx) {
+static void heapSiftDown(hotkeySS *ss, int idx) {
     while (1) {
         int smallest = idx;
         int left = 2 * idx + 1;
         int right = 2 * idx + 2;
-        if (left < tk->size && tk->entries[left].count < tk->entries[smallest].count)
+        if (left < ss->size && ss->entries[left].count < ss->entries[smallest].count)
             smallest = left;
-        if (right < tk->size && tk->entries[right].count < tk->entries[smallest].count)
+        if (right < ss->size && ss->entries[right].count < ss->entries[smallest].count)
             smallest = right;
         if (smallest == idx) break;
-        heapSwap(tk, idx, smallest);
+        heapSwap(ss, idx, smallest);
         idx = smallest;
     }
 }
 
-/* Find (key, dbid) index in heap by linear scan. Returns -1 if not found. */
-static int hotkeyTopKFind(hotkeyTopK *tk, const char *k, size_t klen, int dbid) {
-    for (int i = 0; i < tk->size; i++) {
-        if (tk->entries[i].key &&
-            tk->entries[i].dbid == dbid &&
-            sdslen(tk->entries[i].key) == klen &&
-            memcmp(tk->entries[i].key, k, klen) == 0) {
+/* Find (key, dbid) index in the summary by linear scan. -1 if not found. */
+static int hotkeySSFind(hotkeySS *ss, const char *k, size_t klen, int dbid) {
+    for (int i = 0; i < ss->size; i++) {
+        if (ss->entries[i].key &&
+            ss->entries[i].dbid == dbid &&
+            sdslen(ss->entries[i].key) == klen &&
+            memcmp(ss->entries[i].key, k, klen) == 0) {
             return i;
         }
     }
     return -1;
 }
 
-static void hotkeyTopKAdd(hotkeyTopK *tk, robj *key, uint64_t count, int dbid, int slot) {
+/* Add a single observation of `key` to the summary. */
+static void hotkeySSAdd(hotkeySS *ss, robj *key, int dbid, int slot) {
     sds k = objectGetVal(key);
     size_t klen = sdslen(k);
 
-    /* (Key, dbid) already in heap — update count and fix heap order */
-    int idx = hotkeyTopKFind(tk, k, klen, dbid);
+    /* Case 1: key already tracked — increment its count. */
+    int idx = hotkeySSFind(ss, k, klen, dbid);
     if (idx >= 0) {
-        tk->entries[idx].count = count;
-        tk->entries[idx].dbid = dbid;
-        tk->entries[idx].slot = slot;
-        heapSiftDown(tk, idx);
+        ss->entries[idx].count++;
+        ss->entries[idx].slot = slot;
+        heapSiftDown(ss, idx);
         return;
     }
 
-    /* Room available — insert at end and sift up */
-    if (tk->size < tk->capacity) {
-        idx = tk->size;
-        tk->entries[idx].key = sdsnewlen(k, klen);
-        tk->entries[idx].count = count;
-        tk->entries[idx].dbid = dbid;
-        tk->entries[idx].slot = slot;
-        tk->size++;
-        heapSiftUp(tk, idx);
+    /* Case 2: room available — insert with count=1, error=0. */
+    if (ss->size < ss->capacity) {
+        idx = ss->size;
+        ss->entries[idx].key = sdsnewlen(k, klen);
+        ss->entries[idx].count = 1;
+        ss->entries[idx].error = 0;
+        ss->entries[idx].dbid = dbid;
+        ss->entries[idx].slot = slot;
+        ss->size++;
+        heapSiftUp(ss, idx);
         return;
     }
 
-    /* Full — evict root if new count is larger */
-    if (count > tk->entries[0].count) {
-        sdsfree(tk->entries[0].key);
-        tk->entries[0].key = sdsnewlen(k, klen);
-        tk->entries[0].count = count;
-        tk->entries[0].dbid = dbid;
-        tk->entries[0].slot = slot;
-        heapSiftDown(tk, 0);
-    }
+    /* Case 3: full — replace min entry (root). New entry inherits the evicted
+     * count + 1, and `error` records the maximum overestimate. */
+    uint64_t min_count = ss->entries[0].count;
+    sdsfree(ss->entries[0].key);
+    ss->entries[0].key = sdsnewlen(k, klen);
+    ss->entries[0].count = min_count + 1;
+    ss->entries[0].error = min_count;
+    ss->entries[0].dbid = dbid;
+    ss->entries[0].slot = slot;
+    heapSiftDown(ss, 0);
 }
 
 /* ===========================================================================
  * Hotkey manager lifecycle
  * ==========================================================================*/
 
-hotkeyManager *hotkeyManagerInit(size_t cms_width, size_t cms_depth) {
+hotkeyManager *hotkeyManagerInit(int top_k) {
     hotkeyManager *m = zcalloc(sizeof(hotkeyManager));
-    m->read_cms = newHotkeyCMS(cms_width, cms_depth);
-    m->read_topk = hotkeyTopKNew(server.hotkey_top_k);
-    m->write_cms = newHotkeyCMS(cms_width, cms_depth);
-    m->write_topk = hotkeyTopKNew(server.hotkey_top_k);
+    m->read_ss = hotkeySSNew(top_k);
+    m->write_ss = hotkeySSNew(top_k);
     return m;
 }
 
 void hotkeyManagerFree(hotkeyManager *m) {
     if (!m) return;
-    if (m->read_cms) freeHotkeyCMS(m->read_cms);
-    if (m->read_topk) hotkeyTopKFree(m->read_topk);
-    if (m->write_cms) freeHotkeyCMS(m->write_cms);
-    if (m->write_topk) hotkeyTopKFree(m->write_topk);
+    if (m->read_ss) hotkeySSFree(m->read_ss);
+    if (m->write_ss) hotkeySSFree(m->write_ss);
     zfree(m);
 }
 
 void hotkeyManagerReset(hotkeyManager *m) {
     if (!m) return;
-    if (m->read_cms) hotkeyCMSReset(m->read_cms);
-    if (m->read_topk) hotkeyTopKReset(m->read_topk);
-    if (m->write_cms) hotkeyCMSReset(m->write_cms);
-    if (m->write_topk) hotkeyTopKReset(m->write_topk);
+    if (m->read_ss) hotkeySSReset(m->read_ss);
+    if (m->write_ss) hotkeySSReset(m->write_ss);
 }
 
 void hotkeyPurgeAll(void) {
@@ -241,18 +170,14 @@ void readHotKeyDetection(robj *key, int slot, int dbid) {
     hotkeyManager *m = server.hotkey_manager;
     if (!m || !key) return;
     server.hotkey_runtime_total_sampled++;
-
-    size_t count = hotkeyCMSUpdate(m->read_cms, key);
-    hotkeyTopKAdd(m->read_topk, key, count, dbid, slot);
+    hotkeySSAdd(m->read_ss, key, dbid, slot);
 }
 
 void writeHotKeyDetection(robj *key, int slot, int dbid) {
     hotkeyManager *m = server.hotkey_manager;
     if (!m || !key) return;
     server.hotkey_runtime_total_sampled++;
-
-    size_t count = hotkeyCMSUpdate(m->write_cms, key);
-    hotkeyTopKAdd(m->write_topk, key, count, dbid, slot);
+    hotkeySSAdd(m->write_ss, key, dbid, slot);
 }
 
 /* ===========================================================================
@@ -282,15 +207,15 @@ static uint64_t hotkeyEstimateQPS(uint64_t count) {
     return (count * 100 / server.hotkey_sampling_ratio) / server.hotkey_window_seconds;
 }
 
-static int hotkeyCollectFromTopK(hotkeyTopK *tk, hotkeyCollected *arr, int n, int is_read) {
-    if (!tk) return n;
-    for (int j = 0; j < tk->size; j++) {
-        if (!tk->entries[j].key) continue;
-        arr[n].key = tk->entries[j].key;
-        arr[n].qps = hotkeyEstimateQPS(tk->entries[j].count);
+static int hotkeyCollectFromSS(hotkeySS *ss, hotkeyCollected *arr, int n, int is_read) {
+    if (!ss) return n;
+    for (int j = 0; j < ss->size; j++) {
+        if (!ss->entries[j].key) continue;
+        arr[n].key = ss->entries[j].key;
+        arr[n].qps = hotkeyEstimateQPS(ss->entries[j].count);
         arr[n].is_read = is_read;
-        arr[n].dbid = tk->entries[j].dbid;
-        arr[n].slot = tk->entries[j].slot;
+        arr[n].dbid = ss->entries[j].dbid;
+        arr[n].slot = ss->entries[j].slot;
         n++;
     }
     return n;
@@ -329,10 +254,9 @@ void hotkeysGetCommand(client *c) {
         }
     }
 
-    /* Count total entries to allocate */
     int count = 0;
-    if (filter_type != 0 && m->read_topk) count += m->read_topk->size;
-    if (filter_type != 1 && m->write_topk) count += m->write_topk->size;
+    if (filter_type != 0 && m->read_ss) count += m->read_ss->size;
+    if (filter_type != 1 && m->write_ss) count += m->write_ss->size;
 
     if (count == 0) {
         addReplyArrayLen(c, 0);
@@ -341,12 +265,11 @@ void hotkeysGetCommand(client *c) {
 
     hotkeyCollected *arr = zmalloc(count * sizeof(hotkeyCollected));
     int n = 0;
-    if (filter_type != 0) n = hotkeyCollectFromTopK(m->read_topk, arr, n, 1);
-    if (filter_type != 1) n = hotkeyCollectFromTopK(m->write_topk, arr, n, 0);
+    if (filter_type != 0) n = hotkeyCollectFromSS(m->read_ss, arr, n, 1);
+    if (filter_type != 1) n = hotkeyCollectFromSS(m->write_ss, arr, n, 0);
 
     qsort(arr, n, sizeof(hotkeyCollected), hotkeyCollectedCmpDesc);
 
-    /* Cap output at top_k */
     int limit = n < server.hotkey_top_k ? n : server.hotkey_top_k;
     addReplyArrayLen(c, limit);
     for (int j = 0; j < limit; j++) {
@@ -397,7 +320,7 @@ int hotKeyEnabledCallback(const char **err) {
     UNUSED(err);
     if (server.hotkey_enabled) {
         if (!server.hotkey_manager)
-            server.hotkey_manager = hotkeyManagerInit(server.hotkey_cms_bucket_size, server.hotkey_cms_depth);
+            server.hotkey_manager = hotkeyManagerInit(server.hotkey_top_k);
     } else {
         if (server.hotkey_manager) {
             hotkeyManagerFree(server.hotkey_manager);
@@ -407,24 +330,14 @@ int hotKeyEnabledCallback(const char **err) {
     return 1;
 }
 
-int hotKeyCMSBucketSizeCallback(const char **err) {
+int hotKeyTopKCallback(const char **err) {
     UNUSED(err);
     if (!server.hotkey_enabled) return 1;
+    /* Recreate the manager with the new K. */
     if (server.hotkey_manager) {
         hotkeyManagerFree(server.hotkey_manager);
         server.hotkey_manager = NULL;
     }
-    server.hotkey_manager = hotkeyManagerInit(server.hotkey_cms_bucket_size, server.hotkey_cms_depth);
-    return 1;
-}
-
-int hotKeyCMSDepthCallback(const char **err) {
-    UNUSED(err);
-    if (!server.hotkey_enabled) return 1;
-    if (server.hotkey_manager) {
-        hotkeyManagerFree(server.hotkey_manager);
-        server.hotkey_manager = NULL;
-    }
-    server.hotkey_manager = hotkeyManagerInit(server.hotkey_cms_bucket_size, server.hotkey_cms_depth);
+    server.hotkey_manager = hotkeyManagerInit(server.hotkey_top_k);
     return 1;
 }

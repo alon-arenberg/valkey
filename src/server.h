@@ -1713,39 +1713,35 @@ typedef struct {
 } aofManifest;
 
 /*-----------------------------------------------------------------------------
- * Hotkey definition
+ * Hotkey definition (Space-Saving algorithm)
+ *
+ * Maintains K (key, count, error) entries. On overflow, the entry with the
+ * smallest count is evicted and replaced; the new entry's count becomes the
+ * evicted count + 1, and `error` records the maximum possible overestimate.
+ * For any tracked key, the true count is in [count - error, count].
  *----------------------------------------------------------------------------*/
 
-/* Count-Min Sketch structure definition */
-typedef struct {
-    uint32_t width;      /* Number of buckets per hash function (must be power of 2) */
-    uint32_t depth;      /* Number of hash functions */
-    uint32_t *array;     /* Count matrix */
-    uint32_t counter;    /* Counter */
-    uint32_t width_mask; /* width - 1, used for bitwise optimization of modulo operation */
-} hotkeyCMS;
-
-/* Min-heap entry for top-K hotkey tracking */
+/* Space-Saving entry */
 typedef struct {
     sds key;            /* Key name */
-    uint64_t count;     /* CMS count estimate */
+    uint64_t count;     /* Estimated count (upper bound on true count) */
+    uint64_t error;     /* Max overestimate vs. true count */
     int dbid;           /* Database id */
     int slot;           /* Hash slot (0 in standalone mode) */
-} hotkeyTopKEntry;
+} hotkeySSEntry;
 
-/* Min-heap top-K tracker: root is smallest, linear key search for membership */
+/* Space-Saving top-K tracker. Min-heap ordered by `count` so the root is the
+ * eviction candidate. Linear scan for (key, dbid) membership (K is small). */
 typedef struct {
-    hotkeyTopKEntry *entries; /* Heap array */
-    int capacity;             /* Max entries (K) */
-    int size;                 /* Current entries */
-} hotkeyTopK;
+    hotkeySSEntry *entries; /* Heap array */
+    int capacity;           /* Max entries (K) */
+    int size;               /* Current entries */
+} hotkeySS;
 
-/* Hotkey manager: single global CMS + top-K per access type */
+/* Hotkey manager: one Space-Saving summary per access type */
 typedef struct {
-    hotkeyCMS *read_cms;
-    hotkeyTopK *read_topk;
-    hotkeyCMS *write_cms;
-    hotkeyTopK *write_topk;
+    hotkeySS *read_ss;
+    hotkeySS *write_ss;
 } hotkeyManager;
 
 /*-----------------------------------------------------------------------------
@@ -2419,9 +2415,7 @@ struct valkeyServer {
     /* Hotkey parameters */
     int hotkey_enabled;                              /* Globally control the enabling / disabling of the hot key detection function. */
     int hotkey_sampling_ratio;                       /* The ratio of hotkey sampling. */
-    int hotkey_cms_bucket_size;                      /* The size of the CMS bucket. */
-    int hotkey_cms_depth;                            /* The depth of the CMS (number of hash functions). */
-    int hotkey_top_k;                               /* Number of top keys to track per type in min-heap. */
+    int hotkey_top_k;                                /* Number of top keys to track per type (Space-Saving K). */
     int hotkey_window_seconds;                       /* Detection window length in seconds. */
     unsigned long long hotkey_runtime_total_sampled; /* Total number of sampled keys */
     hotkeyManager *hotkey_manager;
@@ -4272,14 +4266,8 @@ void hotkeysResetCommand(client *c);
 
 /* Hotkey */
 int hotKeyEnabledCallback(const char **err);
-int hotKeyCMSBucketSizeCallback(const char **err);
-int hotKeyCMSDepthCallback(const char **err);
-uint32_t murmurHash2(const void *key, int len, uint32_t seed);
-hotkeyCMS *newHotkeyCMS(size_t width, size_t depth);
-void freeHotkeyCMS(hotkeyCMS *hotkey_cms);
-size_t hotkeyCMSUpdate(hotkeyCMS *hotkey_cms, robj *key);
-void hotkeyCMSReset(hotkeyCMS *hotkey_cms);
-hotkeyManager *hotkeyManagerInit(size_t cms_width, size_t cms_depth);
+int hotKeyTopKCallback(const char **err);
+hotkeyManager *hotkeyManagerInit(int top_k);
 void hotkeyManagerFree(hotkeyManager *manager);
 void hotkeyManagerReset(hotkeyManager *manager);
 void hotkeyPurgeAll(void);
