@@ -15,34 +15,37 @@
 /* ===========================================================================
  * Command argument parsing helpers
  * ==========================================================================*/
-
+/* Hotkey filter type constants used by parseHotkeyFilterArgs / hotkeysGetCommand. */
+#define HOTKEY_FILTER_ALL   -1
+#define HOTKEY_FILTER_WRITE  0
+#define HOTKEY_FILTER_READ   1
 /* Parse [TYPE {read|write|all}] argument.
- * Returns 1 on success, 0 on error (error reply already sent). */
+ * Returns C_OK on success, C_ERR on error (error reply already sent). */
 static int parseHotkeyFilterArgs(client *c, int start_idx, int *filter_type) {
     int i = start_idx;
 
-    *filter_type = -1;
+    *filter_type = HOTKEY_FILTER_ALL;
 
     while (i < c->argc) {
         if (!strcasecmp(objectGetVal(c->argv[i]), "TYPE") && i + 1 < c->argc) {
             char *t = objectGetVal(c->argv[i + 1]);
             if (!strcasecmp(t, "read"))
-                *filter_type = 1;
+                *filter_type = HOTKEY_FILTER_READ;
             else if (!strcasecmp(t, "write"))
-                *filter_type = 0;
+                *filter_type = HOTKEY_FILTER_WRITE;
             else if (!strcasecmp(t, "all"))
-                *filter_type = -1;
+                *filter_type = HOTKEY_FILTER_ALL;
             else {
                 addReplyError(c, "Invalid type. Use 'read', 'write', or 'all'");
-                return 0;
+                return C_ERR;
             }
             i += 2;
         } else {
             addReplyError(c, "Syntax error. Use [TYPE {read|write|all}]");
-            return 0;
+            return C_ERR;
         }
     }
-    return 1;
+    return C_OK;
 }
 
 
@@ -281,12 +284,12 @@ void hotkeysGetCommand(client *c) {
         addReplyArrayLen(c, 0);
         return;
     }
-    if (!parseHotkeyFilterArgs(c, 2, &filter_type)) return;
+    if (parseHotkeyFilterArgs(c, 2, &filter_type) == C_ERR) return;
 
     count = 0;
-    if (filter_type == -1 || filter_type == 1)
+    if (filter_type == HOTKEY_FILTER_ALL || filter_type == HOTKEY_FILTER_READ)
         count += hotkeyCountActive(m->read_summary);
-    if (filter_type == -1 || filter_type == 0)
+    if (filter_type == HOTKEY_FILTER_ALL || filter_type == HOTKEY_FILTER_WRITE)
         count += hotkeyCountActive(m->write_summary);
 
     if (count == 0) {
@@ -296,9 +299,9 @@ void hotkeysGetCommand(client *c) {
 
     collected = zmalloc(count * sizeof(hotkeyMGCollected));
     n = 0;
-    if (filter_type == -1 || filter_type == 1)
+    if (filter_type == HOTKEY_FILTER_ALL || filter_type == HOTKEY_FILTER_READ)
         n = hotkeyCollectEntries(m->read_summary, collected, n, 1);
-    if (filter_type == -1 || filter_type == 0)
+    if (filter_type == HOTKEY_FILTER_ALL || filter_type == HOTKEY_FILTER_WRITE)
         n = hotkeyCollectEntries(m->write_summary, collected, n, 0);
 
     if (n > 0) qsort(collected, n, sizeof(hotkeyMGCollected), hotkeyMGCollectedCmp);

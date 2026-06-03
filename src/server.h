@@ -1716,7 +1716,6 @@ typedef struct {
  * Hotkey definition — Misra-Gries based hot key detection
  *----------------------------------------------------------------------------*/
 
-#define HOTKEY_SLOTS 16384
 
 /* Misra-Gries summary: parallel arrays of at most max_keys entries */
 typedef struct {
