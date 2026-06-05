@@ -1,4 +1,24 @@
 #include "server.h"
+#include <math.h>
+
+/* ---------------------------------------------------------------------------
+ * Lazy time-anchored exponential decay
+ *
+ * Instead of resetting the Space-Saving summaries on a fixed window boundary,
+ * (count, error) decay exponentially toward zero over time. Decay is applied
+ * lazily (at most once per tick) on access and on query, anchored to the
+ * monotonic clock — so a stalled cron has no effect on accuracy. A key
+ * arriving at a steady sampled rate r converges to count = r/lambda, so the
+ * access rate is recovered as: qps = count * lambda * (100 / sampling_ratio).
+ * --------------------------------------------------------------------------*/
+
+/* ln(2), used to convert a half-life into a decay rate lambda = ln2/half_life. */
+#define HOTKEY_LN2 0.6931471805599453
+/* Amortize the O(K) decay sweep: advance decay at most once per this interval. */
+#define HOTKEY_DECAY_TICK_US 100000 /* 100ms */
+/* Evict an entry once its decayed count falls below this floor (less than half
+ * a sampled hit) so faded keys release their slot. */
+#define HOTKEY_MIN_COUNT 0.5
 
 /* ===========================================================================
  * Space-Saving algorithm for Top-K heavy hitters
@@ -43,8 +63,8 @@ static void hotkeySSReset(hotkeySS *ss) {
     for (int i = 0; i < ss->size; i++) {
         if (ss->entries[i].key) sdsfree(ss->entries[i].key);
         ss->entries[i].key = NULL;
-        ss->entries[i].count = 0;
-        ss->entries[i].error = 0;
+        ss->entries[i].count = 0.0;
+        ss->entries[i].error = 0.0;
     }
     ss->size = 0;
 }
@@ -103,7 +123,7 @@ static void hotkeySSAdd(hotkeySS *ss, robj *key, int dbid, int slot) {
     /* Case 1: key already tracked — increment its count. */
     int idx = hotkeySSFind(ss, k, klen, dbid);
     if (idx >= 0) {
-        ss->entries[idx].count++;
+        ss->entries[idx].count += 1.0;
         ss->entries[idx].slot = slot;
         heapSiftDown(ss, idx);
         return;
@@ -113,8 +133,8 @@ static void hotkeySSAdd(hotkeySS *ss, robj *key, int dbid, int slot) {
     if (ss->size < ss->capacity) {
         idx = ss->size;
         ss->entries[idx].key = sdsnewlen(k, klen);
-        ss->entries[idx].count = 1;
-        ss->entries[idx].error = 0;
+        ss->entries[idx].count = 1.0;
+        ss->entries[idx].error = 0.0;
         ss->entries[idx].dbid = dbid;
         ss->entries[idx].slot = slot;
         ss->size++;
@@ -124,14 +144,38 @@ static void hotkeySSAdd(hotkeySS *ss, robj *key, int dbid, int slot) {
 
     /* Case 3: full — replace min entry (root). New entry inherits the evicted
      * count + 1, and `error` records the maximum overestimate. */
-    uint64_t min_count = ss->entries[0].count;
+    double min_count = ss->entries[0].count;
     sdsfree(ss->entries[0].key);
     ss->entries[0].key = sdsnewlen(k, klen);
-    ss->entries[0].count = min_count + 1;
+    ss->entries[0].count = min_count + 1.0;
     ss->entries[0].error = min_count;
     ss->entries[0].dbid = dbid;
     ss->entries[0].slot = slot;
     heapSiftDown(ss, 0);
+}
+
+/* Decay every entry's (count, error) by f, drop entries that fade below the
+ * eviction floor, then re-establish the min-heap invariant. */
+static void hotkeySSDecayAndPrune(hotkeySS *ss, double f) {
+    if (!ss) return;
+    int w = 0;
+    for (int i = 0; i < ss->size; i++) {
+        if (!ss->entries[i].key) continue;
+        double cnt = ss->entries[i].count * f;
+        double err = ss->entries[i].error * f;
+        if (cnt < HOTKEY_MIN_COUNT) {
+            sdsfree(ss->entries[i].key);
+            ss->entries[i].key = NULL;
+            continue;
+        }
+        ss->entries[w] = ss->entries[i];
+        ss->entries[w].count = cnt;
+        ss->entries[w].error = err;
+        w++;
+    }
+    ss->size = w;
+    /* Re-heapify the compacted array (min-heap by count). */
+    for (int i = ss->size / 2 - 1; i >= 0; i--) heapSiftDown(ss, i);
 }
 
 /* ===========================================================================
@@ -142,6 +186,7 @@ hotkeyManager *hotkeyManagerInit(int top_k) {
     hotkeyManager *m = zcalloc(sizeof(hotkeyManager));
     m->read_ss = hotkeySSNew(top_k);
     m->write_ss = hotkeySSNew(top_k);
+    m->last_decay_us = getMonotonicUs();
     return m;
 }
 
@@ -156,6 +201,29 @@ void hotkeyManagerReset(hotkeyManager *m) {
     if (!m) return;
     if (m->read_ss) hotkeySSReset(m->read_ss);
     if (m->write_ss) hotkeySSReset(m->write_ss);
+    m->last_decay_us = getMonotonicUs();
+}
+
+/* Lazy, time-anchored exponential decay of both summaries.
+ *
+ * Advances (count, error) to `now_us` by multiplying by f = exp(-lambda *
+ * elapsed_seconds), at most once per tick so the O(K) sweep is amortized and
+ * immune to cron stalls. Faded entries are pruned. Multiplying every entry by
+ * the same factor preserves the min-heap order. */
+static void hotkeyManagerDecayToNow(hotkeyManager *m, uint64_t now_us) {
+    uint64_t dt;
+    double f, lambda;
+
+    if (!m || server.hotkey_half_life_seconds <= 0) return;
+    if (now_us <= m->last_decay_us) return; /* monotonic guard */
+    dt = now_us - m->last_decay_us;
+    if (dt < HOTKEY_DECAY_TICK_US) return; /* amortize */
+
+    lambda = HOTKEY_LN2 / (double)server.hotkey_half_life_seconds;
+    f = exp(-lambda * ((double)dt / 1e6));
+    hotkeySSDecayAndPrune(m->read_ss, f);
+    hotkeySSDecayAndPrune(m->write_ss, f);
+    m->last_decay_us = now_us;
 }
 
 void hotkeyPurgeAll(void) {
@@ -170,6 +238,7 @@ void readHotKeyDetection(robj *key, int slot, int dbid) {
     hotkeyManager *m = server.hotkey_manager;
     if (!m || !key) return;
     server.hotkey_runtime_total_sampled++;
+    hotkeyManagerDecayToNow(m, getMonotonicUs());
     hotkeySSAdd(m->read_ss, key, dbid, slot);
 }
 
@@ -177,6 +246,7 @@ void writeHotKeyDetection(robj *key, int slot, int dbid) {
     hotkeyManager *m = server.hotkey_manager;
     if (!m || !key) return;
     server.hotkey_runtime_total_sampled++;
+    hotkeyManagerDecayToNow(m, getMonotonicUs());
     hotkeySSAdd(m->write_ss, key, dbid, slot);
 }
 
@@ -200,11 +270,18 @@ static int hotkeyCollectedCmpDesc(const void *a, const void *b) {
     return 0;
 }
 
-/* Extrapolate QPS from sampled count:
- * qps = count * (100 / sampling_ratio) / window_seconds */
-static uint64_t hotkeyEstimateQPS(uint64_t count) {
-    if (server.hotkey_sampling_ratio <= 0 || server.hotkey_window_seconds <= 0) return 0;
-    return (count * 100 / server.hotkey_sampling_ratio) / server.hotkey_window_seconds;
+/* Recover access rate from a decayed Space-Saving entry using the midpoint of
+ * the [count-error, count] band:
+ *   qps = (count - error/2) * lambda * (100 / sampling_ratio)
+ * where lambda = ln2 / half_life. A key arriving at a steady sampled rate r
+ * settles at count = r/lambda, so this returns the true rate. */
+static uint64_t hotkeyEstimateQPS(double count, double error) {
+    if (server.hotkey_sampling_ratio <= 0 || server.hotkey_half_life_seconds <= 0) return 0;
+    double midpoint = count - error / 2.0;
+    if (midpoint <= 0.0) return 0;
+    double lambda = HOTKEY_LN2 / (double)server.hotkey_half_life_seconds;
+    double scale = 100.0 / (double)server.hotkey_sampling_ratio;
+    return (uint64_t)(midpoint * lambda * scale + 0.5);
 }
 
 static int hotkeyCollectFromSS(hotkeySS *ss, hotkeyCollected *arr, int n, int is_read) {
@@ -212,7 +289,7 @@ static int hotkeyCollectFromSS(hotkeySS *ss, hotkeyCollected *arr, int n, int is
     for (int j = 0; j < ss->size; j++) {
         if (!ss->entries[j].key) continue;
         arr[n].key = ss->entries[j].key;
-        arr[n].qps = hotkeyEstimateQPS(ss->entries[j].count);
+        arr[n].qps = hotkeyEstimateQPS(ss->entries[j].count, ss->entries[j].error);
         arr[n].is_read = is_read;
         arr[n].dbid = ss->entries[j].dbid;
         arr[n].slot = ss->entries[j].slot;
@@ -231,6 +308,9 @@ void hotkeysGetCommand(client *c) {
         addReplyArrayLen(c, 0);
         return;
     }
+
+    /* Advance decay so the reported counts reflect the current instant. */
+    hotkeyManagerDecayToNow(m, getMonotonicUs());
 
     int filter_type = -1;
     int i = 2;

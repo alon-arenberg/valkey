@@ -3422,7 +3422,7 @@ standardConfig static_configs[] = {
     createIntConfig("cluster-message-gossip-perc", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 100, server.cluster_message_gossip_perc, 10, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("hotkey-sampling-ratio", NULL, MODIFIABLE_CONFIG, 1, 100, server.hotkey_sampling_ratio, 1, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("hotkey-top-k", NULL, MODIFIABLE_CONFIG, 1, 1000, server.hotkey_top_k, 16, INTEGER_CONFIG, NULL, hotKeyTopKCallback),
-    createIntConfig("hotkey-window-seconds", NULL, MODIFIABLE_CONFIG, 1, 60, server.hotkey_window_seconds, 1, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("hotkey-half-life-seconds", NULL, MODIFIABLE_CONFIG, 1, 3600, server.hotkey_half_life_seconds, 30, INTEGER_CONFIG, NULL, NULL),
 
     /* Unsigned int configs */
     createUIntConfig("maxclients", NULL, MODIFIABLE_CONFIG, 1, UINT_MAX, server.maxclients, 10000, INTEGER_CONFIG, NULL, updateMaxclients),

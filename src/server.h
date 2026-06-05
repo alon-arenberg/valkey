@@ -1721,11 +1721,14 @@ typedef struct {
  * For any tracked key, the true count is in [count - error, count].
  *----------------------------------------------------------------------------*/
 
-/* Space-Saving entry */
+/* Space-Saving entry.
+ * count/error are decayed exponentially over time (time-anchored lazy decay)
+ * instead of being reset on a fixed window boundary, so they reflect a
+ * recency-weighted access rate. */
 typedef struct {
     sds key;            /* Key name */
-    uint64_t count;     /* Estimated count (upper bound on true count) */
-    uint64_t error;     /* Max overestimate vs. true count */
+    double count;       /* Decayed estimated count (upper bound on true count) */
+    double error;       /* Decayed max overestimate vs. true count */
     int dbid;           /* Database id */
     int slot;           /* Hash slot (0 in standalone mode) */
 } hotkeySSEntry;
@@ -1742,6 +1745,7 @@ typedef struct {
 typedef struct {
     hotkeySS *read_ss;
     hotkeySS *write_ss;
+    uint64_t last_decay_us; /* Monotonic timestamp of last decay sweep */
 } hotkeyManager;
 
 /*-----------------------------------------------------------------------------
@@ -2416,7 +2420,7 @@ struct valkeyServer {
     int hotkey_enabled;                              /* Globally control the enabling / disabling of the hot key detection function. */
     int hotkey_sampling_ratio;                       /* The ratio of hotkey sampling. */
     int hotkey_top_k;                                /* Number of top keys to track per type (Space-Saving K). */
-    int hotkey_window_seconds;                       /* Detection window length in seconds. */
+    int hotkey_half_life_seconds;                    /* Exponential decay half-life in seconds. */
     unsigned long long hotkey_runtime_total_sampled; /* Total number of sampled keys */
     hotkeyManager *hotkey_manager;
 };
