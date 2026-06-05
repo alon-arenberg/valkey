@@ -1716,11 +1716,14 @@ typedef struct {
  * Hotkey definition
  *----------------------------------------------------------------------------*/
 
-/* Count-Min Sketch structure definition */
+/* Count-Min Sketch structure definition.
+ * Cell counts are decayed exponentially over time (time-anchored lazy decay)
+ * instead of being reset on a fixed window boundary, so they reflect a
+ * recency-weighted access rate. */
 typedef struct {
     uint32_t width;      /* Number of buckets per hash function (must be power of 2) */
     uint32_t depth;      /* Number of hash functions */
-    uint32_t *array;     /* Count matrix */
+    double *array;       /* Decayed count matrix */
     uint32_t counter;    /* Counter */
     uint32_t width_mask; /* width - 1, used for bitwise optimization of modulo operation */
 } hotkeyCMS;
@@ -1728,7 +1731,7 @@ typedef struct {
 /* Min-heap entry for top-K hotkey tracking */
 typedef struct {
     sds key;            /* Key name */
-    uint64_t count;     /* CMS count estimate */
+    double count;       /* Decayed CMS count estimate */
     int dbid;           /* Database id */
     int slot;           /* Hash slot (0 in standalone mode) */
 } hotkeyTopKEntry;
@@ -1746,6 +1749,8 @@ typedef struct {
     hotkeyTopK *read_topk;
     hotkeyCMS *write_cms;
     hotkeyTopK *write_topk;
+    uint64_t topk_last_decay_us; /* Monotonic ts of last top-K decay (lazy, hot path) */
+    uint64_t cms_last_decay_us;  /* Monotonic ts of last CMS grid decay (serverCron) */
 } hotkeyManager;
 
 /*-----------------------------------------------------------------------------
@@ -2422,7 +2427,7 @@ struct valkeyServer {
     int hotkey_cms_bucket_size;                      /* The size of the CMS bucket. */
     int hotkey_cms_depth;                            /* The depth of the CMS (number of hash functions). */
     int hotkey_top_k;                               /* Number of top keys to track per type in min-heap. */
-    int hotkey_window_seconds;                       /* Detection window length in seconds. */
+    int hotkey_half_life_seconds;                    /* Exponential decay half-life in seconds. */
     unsigned long long hotkey_runtime_total_sampled; /* Total number of sampled keys */
     hotkeyManager *hotkey_manager;
 };
@@ -4277,11 +4282,12 @@ int hotKeyCMSDepthCallback(const char **err);
 uint32_t murmurHash2(const void *key, int len, uint32_t seed);
 hotkeyCMS *newHotkeyCMS(size_t width, size_t depth);
 void freeHotkeyCMS(hotkeyCMS *hotkey_cms);
-size_t hotkeyCMSUpdate(hotkeyCMS *hotkey_cms, robj *key);
+double hotkeyCMSUpdate(hotkeyCMS *hotkey_cms, robj *key);
 void hotkeyCMSReset(hotkeyCMS *hotkey_cms);
 hotkeyManager *hotkeyManagerInit(size_t cms_width, size_t cms_depth);
 void hotkeyManagerFree(hotkeyManager *manager);
 void hotkeyManagerReset(hotkeyManager *manager);
+void hotkeyManagerDecayCMS(hotkeyManager *manager, uint64_t now_us);
 void hotkeyPurgeAll(void);
 void writeHotKeyDetection(robj *key, int slot, int dbid);
 void readHotKeyDetection(robj *key, int slot, int dbid);

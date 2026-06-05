@@ -3424,7 +3424,7 @@ standardConfig static_configs[] = {
     createIntConfig("hotkey-cms-bucket-size", NULL, MODIFIABLE_CONFIG, 1000, 30000, server.hotkey_cms_bucket_size, 8192, INTEGER_CONFIG, NULL, hotKeyCMSBucketSizeCallback),
     createIntConfig("hotkey-cms-depth", NULL, MODIFIABLE_CONFIG, 2, 8, server.hotkey_cms_depth, 4, INTEGER_CONFIG, NULL, hotKeyCMSDepthCallback),
     createIntConfig("hotkey-top-k", NULL, MODIFIABLE_CONFIG, 1, 1000, server.hotkey_top_k, 16, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("hotkey-window-seconds", NULL, MODIFIABLE_CONFIG, 1, 60, server.hotkey_window_seconds, 1, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("hotkey-half-life-seconds", NULL, MODIFIABLE_CONFIG, 1, 3600, server.hotkey_half_life_seconds, 30, INTEGER_CONFIG, NULL, NULL),
 
     /* Unsigned int configs */
     createUIntConfig("maxclients", NULL, MODIFIABLE_CONFIG, 1, UINT_MAX, server.maxclients, 10000, INTEGER_CONFIG, NULL, updateMaxclients),

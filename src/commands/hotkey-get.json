@@ -1,6 +1,6 @@
 {
     "GET": {
-        "summary": "Get hot keys from history",
+        "summary": "Get the hottest keys ranked by decayed access rate",
         "complexity": "O(N) where N is the number of hot keys in the history",
         "group": "server",
         "since": "9.0.0",

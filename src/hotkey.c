@@ -1,4 +1,24 @@
 #include "server.h"
+#include <math.h>
+
+/* ---------------------------------------------------------------------------
+ * Lazy time-anchored exponential decay
+ *
+ * Instead of resetting the CMS and top-K heaps on a fixed window boundary,
+ * counts decay exponentially toward zero over time. Decay is applied lazily
+ * (at most once per tick) on access and on query, anchored to the monotonic
+ * clock — so a stalled cron has no effect on accuracy. The decayed count of a
+ * key arriving at a steady sampled rate r converges to r/lambda, so the access
+ * rate is recovered as: qps = count * lambda * (100 / sampling_ratio).
+ * --------------------------------------------------------------------------*/
+
+/* ln(2), used to convert a half-life into a decay rate lambda = ln2/half_life. */
+#define HOTKEY_LN2 0.6931471805599453
+/* Amortize the decay sweep: advance decay at most once per this interval. */
+#define HOTKEY_DECAY_TICK_US 100000 /* 100ms */
+/* Evict a heap entry once its decayed count falls below this floor (less than
+ * half a sampled hit) so faded keys release their slot. */
+#define HOTKEY_MIN_COUNT 0.5
 
 /* ===========================================================================
  * Count-Min Sketch
@@ -49,7 +69,7 @@ hotkeyCMS *newHotkeyCMS(size_t width, size_t depth) {
     cms->depth = depth;
     cms->counter = 0;
     cms->width_mask = adjusted_width - 1;
-    cms->array = zcalloc(adjusted_width * depth * sizeof(uint32_t));
+    cms->array = zcalloc(adjusted_width * depth * sizeof(double));
     return cms;
 }
 
@@ -59,26 +79,33 @@ void freeHotkeyCMS(hotkeyCMS *cms) {
     zfree(cms);
 }
 
-size_t hotkeyCMSUpdate(hotkeyCMS *cms, robj *key) {
+double hotkeyCMSUpdate(hotkeyCMS *cms, robj *key) {
     if (!cms || !key || !objectGetVal(key)) return 0;
     size_t len = stringObjectLen(key);
     if (len == 0) return 0;
 
-    size_t minCount = (size_t)-1;
+    double minCount = -1.0;
     for (size_t i = 0; i < cms->depth; ++i) {
         uint32_t hash = murmurHash2(objectGetVal(key), len, i);
         size_t loc = (hash & cms->width_mask) + (i * cms->width);
-        cms->array[loc]++;
-        minCount = min(minCount, cms->array[loc]);
+        cms->array[loc] += 1.0;
+        if (minCount < 0.0 || cms->array[loc] < minCount) minCount = cms->array[loc];
     }
     cms->counter++;
-    return minCount;
+    return minCount < 0.0 ? 0.0 : minCount;
 }
 
 void hotkeyCMSReset(hotkeyCMS *cms) {
     if (!cms || !cms->array) return;
-    memset(cms->array, 0, (size_t)cms->width * cms->depth * sizeof(uint32_t));
+    memset(cms->array, 0, (size_t)cms->width * cms->depth * sizeof(double));
     cms->counter = 0;
+}
+
+/* Multiply every CMS cell by the decay factor f. */
+static void hotkeyCMSDecay(hotkeyCMS *cms, double f) {
+    if (!cms || !cms->array) return;
+    size_t total = (size_t)cms->width * cms->depth;
+    for (size_t i = 0; i < total; i++) cms->array[i] *= f;
 }
 
 /* ===========================================================================
@@ -162,7 +189,7 @@ static int hotkeyTopKFind(hotkeyTopK *tk, const char *k, size_t klen, int dbid) 
     return -1;
 }
 
-static void hotkeyTopKAdd(hotkeyTopK *tk, robj *key, uint64_t count, int dbid, int slot) {
+static void hotkeyTopKAdd(hotkeyTopK *tk, robj *key, double count, int dbid, int slot) {
     sds k = objectGetVal(key);
     size_t klen = sdslen(k);
 
@@ -199,6 +226,28 @@ static void hotkeyTopKAdd(hotkeyTopK *tk, robj *key, uint64_t count, int dbid, i
     }
 }
 
+/* Decay every heap entry by f, drop entries that fade below the eviction
+ * floor, then re-establish the min-heap invariant. */
+static void hotkeyTopKDecayAndPrune(hotkeyTopK *tk, double f) {
+    if (!tk) return;
+    int w = 0;
+    for (int i = 0; i < tk->size; i++) {
+        if (!tk->entries[i].key) continue;
+        double c = tk->entries[i].count * f;
+        if (c < HOTKEY_MIN_COUNT) {
+            sdsfree(tk->entries[i].key);
+            tk->entries[i].key = NULL;
+            continue;
+        }
+        tk->entries[w] = tk->entries[i];
+        tk->entries[w].count = c;
+        w++;
+    }
+    tk->size = w;
+    /* Re-heapify the compacted array (min-heap). */
+    for (int i = tk->size / 2 - 1; i >= 0; i--) heapSiftDown(tk, i);
+}
+
 /* ===========================================================================
  * Hotkey manager lifecycle
  * ==========================================================================*/
@@ -209,6 +258,8 @@ hotkeyManager *hotkeyManagerInit(size_t cms_width, size_t cms_depth) {
     m->read_topk = hotkeyTopKNew(server.hotkey_top_k);
     m->write_cms = newHotkeyCMS(cms_width, cms_depth);
     m->write_topk = hotkeyTopKNew(server.hotkey_top_k);
+    m->topk_last_decay_us = getMonotonicUs();
+    m->cms_last_decay_us = m->topk_last_decay_us;
     return m;
 }
 
@@ -227,6 +278,51 @@ void hotkeyManagerReset(hotkeyManager *m) {
     if (m->read_topk) hotkeyTopKReset(m->read_topk);
     if (m->write_cms) hotkeyCMSReset(m->write_cms);
     if (m->write_topk) hotkeyTopKReset(m->write_topk);
+    m->topk_last_decay_us = getMonotonicUs();
+    m->cms_last_decay_us = m->topk_last_decay_us;
+}
+
+/* Lazy decay of the top-K heaps — the structures HOTKEYS GET reports from.
+ *
+ * Runs on every sampled access and on query, anchored to the monotonic clock
+ * and amortized to at most once per tick. The heaps are tiny (O(K)), so this
+ * is cheap and keeps reported QPS cron-stall-immune. */
+static void hotkeyDecayTopK(hotkeyManager *m, uint64_t now_us) {
+    uint64_t dt;
+    double f, lambda;
+
+    if (!m || server.hotkey_half_life_seconds <= 0) return;
+    if (now_us <= m->topk_last_decay_us) return; /* monotonic guard */
+    dt = now_us - m->topk_last_decay_us;
+    if (dt < HOTKEY_DECAY_TICK_US) return; /* amortize */
+
+    lambda = HOTKEY_LN2 / (double)server.hotkey_half_life_seconds;
+    f = exp(-lambda * ((double)dt / 1e6));
+    hotkeyTopKDecayAndPrune(m->read_topk, f);
+    hotkeyTopKDecayAndPrune(m->write_topk, f);
+    m->topk_last_decay_us = now_us;
+}
+
+/* Decay the CMS grids. Driven from serverCron as a bounded background sweep
+ * instead of on the hot path, so the large O(width*depth) multiply never
+ * touches lookupKey. Time-anchored: a cron stall just yields a larger decay
+ * factor on the next run (self-correcting). The grids only feed admission
+ * estimates, so brief staleness is harmless — reported QPS comes from the
+ * heaps, which decay lazily. */
+void hotkeyManagerDecayCMS(hotkeyManager *m, uint64_t now_us) {
+    uint64_t dt;
+    double f, lambda;
+
+    if (!m || server.hotkey_half_life_seconds <= 0) return;
+    if (now_us <= m->cms_last_decay_us) return; /* monotonic guard */
+    dt = now_us - m->cms_last_decay_us;
+    if (dt < HOTKEY_DECAY_TICK_US) return; /* amortize */
+
+    lambda = HOTKEY_LN2 / (double)server.hotkey_half_life_seconds;
+    f = exp(-lambda * ((double)dt / 1e6));
+    hotkeyCMSDecay(m->read_cms, f);
+    hotkeyCMSDecay(m->write_cms, f);
+    m->cms_last_decay_us = now_us;
 }
 
 void hotkeyPurgeAll(void) {
@@ -242,7 +338,8 @@ void readHotKeyDetection(robj *key, int slot, int dbid) {
     if (!m || !key) return;
     server.hotkey_runtime_total_sampled++;
 
-    size_t count = hotkeyCMSUpdate(m->read_cms, key);
+    hotkeyDecayTopK(m, getMonotonicUs());
+    double count = hotkeyCMSUpdate(m->read_cms, key);
     hotkeyTopKAdd(m->read_topk, key, count, dbid, slot);
 }
 
@@ -251,7 +348,8 @@ void writeHotKeyDetection(robj *key, int slot, int dbid) {
     if (!m || !key) return;
     server.hotkey_runtime_total_sampled++;
 
-    size_t count = hotkeyCMSUpdate(m->write_cms, key);
+    hotkeyDecayTopK(m, getMonotonicUs());
+    double count = hotkeyCMSUpdate(m->write_cms, key);
     hotkeyTopKAdd(m->write_topk, key, count, dbid, slot);
 }
 
@@ -275,11 +373,16 @@ static int hotkeyCollectedCmpDesc(const void *a, const void *b) {
     return 0;
 }
 
-/* Extrapolate QPS from sampled count:
- * qps = count * (100 / sampling_ratio) / window_seconds */
-static uint64_t hotkeyEstimateQPS(uint64_t count) {
-    if (server.hotkey_sampling_ratio <= 0 || server.hotkey_window_seconds <= 0) return 0;
-    return (count * 100 / server.hotkey_sampling_ratio) / server.hotkey_window_seconds;
+/* Recover access rate from a decayed count:
+ *   qps = count * lambda * (100 / sampling_ratio)
+ * where lambda = ln2 / half_life. A key arriving at a steady sampled rate r
+ * settles at count = r/lambda, so this returns the true rate. */
+static uint64_t hotkeyEstimateQPS(double count) {
+    if (server.hotkey_sampling_ratio <= 0 || server.hotkey_half_life_seconds <= 0) return 0;
+    if (count <= 0.0) return 0;
+    double lambda = HOTKEY_LN2 / (double)server.hotkey_half_life_seconds;
+    double scale = 100.0 / (double)server.hotkey_sampling_ratio;
+    return (uint64_t)(count * lambda * scale + 0.5);
 }
 
 static int hotkeyCollectFromTopK(hotkeyTopK *tk, hotkeyCollected *arr, int n, int is_read) {
@@ -306,6 +409,10 @@ void hotkeysGetCommand(client *c) {
         addReplyArrayLen(c, 0);
         return;
     }
+
+    /* Advance heap decay so the reported counts reflect the current instant.
+     * The CMS grids are decayed separately in serverCron. */
+    hotkeyDecayTopK(m, getMonotonicUs());
 
     int filter_type = -1;
     int i = 2;
