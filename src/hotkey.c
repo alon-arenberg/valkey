@@ -36,9 +36,10 @@
  *   - For any tracked key: true_count is in [count - error, count].
  *   - Any key with true frequency f > N/K is guaranteed to be tracked.
  *
- * The structure is organized as a min-heap by `count` so the eviction
- * candidate (root) is found in O(1). Membership check is a linear scan
- * since K is small (default 16).
+ * Storage: a flat unordered array of `capacity` entries. K is small
+ * (default 16) so a linear scan finds membership / min entry in a few
+ * cache lines. Avoiding the heap removes sift-down on every hit (the
+ * common path) at the cost of an O(K) min-find on the rarer eviction path.
  * ==========================================================================*/
 
 static hotkeySS *hotkeySSNew(int capacity) {
@@ -69,39 +70,6 @@ static void hotkeySSReset(hotkeySS *ss) {
     ss->size = 0;
 }
 
-static void heapSwap(hotkeySS *ss, int a, int b) {
-    hotkeySSEntry tmp = ss->entries[a];
-    ss->entries[a] = ss->entries[b];
-    ss->entries[b] = tmp;
-}
-
-static void heapSiftUp(hotkeySS *ss, int idx) {
-    while (idx > 0) {
-        int parent = (idx - 1) / 2;
-        if (ss->entries[idx].count < ss->entries[parent].count) {
-            heapSwap(ss, idx, parent);
-            idx = parent;
-        } else {
-            break;
-        }
-    }
-}
-
-static void heapSiftDown(hotkeySS *ss, int idx) {
-    while (1) {
-        int smallest = idx;
-        int left = 2 * idx + 1;
-        int right = 2 * idx + 2;
-        if (left < ss->size && ss->entries[left].count < ss->entries[smallest].count)
-            smallest = left;
-        if (right < ss->size && ss->entries[right].count < ss->entries[smallest].count)
-            smallest = right;
-        if (smallest == idx) break;
-        heapSwap(ss, idx, smallest);
-        idx = smallest;
-    }
-}
-
 /* Find (key, dbid) index in the summary by linear scan. -1 if not found. */
 static int hotkeySSFind(hotkeySS *ss, const char *k, size_t klen, int dbid) {
     for (int i = 0; i < ss->size; i++) {
@@ -115,6 +83,19 @@ static int hotkeySSFind(hotkeySS *ss, const char *k, size_t klen, int dbid) {
     return -1;
 }
 
+/* Find the index of the entry with the smallest count by linear scan. */
+static int hotkeySSMinIdx(hotkeySS *ss) {
+    int min_idx = 0;
+    double min_count = ss->entries[0].count;
+    for (int i = 1; i < ss->size; i++) {
+        if (ss->entries[i].count < min_count) {
+            min_count = ss->entries[i].count;
+            min_idx = i;
+        }
+    }
+    return min_idx;
+}
+
 /* Add a single observation of `key` to the summary. */
 static void hotkeySSAdd(hotkeySS *ss, robj *key, int dbid, int slot) {
     sds k = objectGetVal(key);
@@ -125,11 +106,10 @@ static void hotkeySSAdd(hotkeySS *ss, robj *key, int dbid, int slot) {
     if (idx >= 0) {
         ss->entries[idx].count += 1.0;
         ss->entries[idx].slot = slot;
-        heapSiftDown(ss, idx);
         return;
     }
 
-    /* Case 2: room available — insert with count=1, error=0. */
+    /* Case 2: room available — append with count=1, error=0. */
     if (ss->size < ss->capacity) {
         idx = ss->size;
         ss->entries[idx].key = sdsnewlen(k, klen);
@@ -138,24 +118,24 @@ static void hotkeySSAdd(hotkeySS *ss, robj *key, int dbid, int slot) {
         ss->entries[idx].dbid = dbid;
         ss->entries[idx].slot = slot;
         ss->size++;
-        heapSiftUp(ss, idx);
         return;
     }
 
-    /* Case 3: full — replace min entry (root). New entry inherits the evicted
-     * count + 1, and `error` records the maximum overestimate. */
-    double min_count = ss->entries[0].count;
-    sdsfree(ss->entries[0].key);
-    ss->entries[0].key = sdsnewlen(k, klen);
-    ss->entries[0].count = min_count + 1.0;
-    ss->entries[0].error = min_count;
-    ss->entries[0].dbid = dbid;
-    ss->entries[0].slot = slot;
-    heapSiftDown(ss, 0);
+    /* Case 3: full — replace the entry with the smallest count. The new
+     * entry inherits the evicted count + 1; `error` records the maximum
+     * possible overestimate vs. true count. */
+    int min_idx = hotkeySSMinIdx(ss);
+    double min_count = ss->entries[min_idx].count;
+    sdsfree(ss->entries[min_idx].key);
+    ss->entries[min_idx].key = sdsnewlen(k, klen);
+    ss->entries[min_idx].count = min_count + 1.0;
+    ss->entries[min_idx].error = min_count;
+    ss->entries[min_idx].dbid = dbid;
+    ss->entries[min_idx].slot = slot;
 }
 
 /* Decay every entry's (count, error) by f, drop entries that fade below the
- * eviction floor, then re-establish the min-heap invariant. */
+ * eviction floor, and compact the array. */
 static void hotkeySSDecayAndPrune(hotkeySS *ss, double f) {
     if (!ss) return;
     int w = 0;
@@ -168,14 +148,12 @@ static void hotkeySSDecayAndPrune(hotkeySS *ss, double f) {
             ss->entries[i].key = NULL;
             continue;
         }
-        ss->entries[w] = ss->entries[i];
+        if (w != i) ss->entries[w] = ss->entries[i];
         ss->entries[w].count = cnt;
         ss->entries[w].error = err;
         w++;
     }
     ss->size = w;
-    /* Re-heapify the compacted array (min-heap by count). */
-    for (int i = ss->size / 2 - 1; i >= 0; i--) heapSiftDown(ss, i);
 }
 
 /* ===========================================================================
