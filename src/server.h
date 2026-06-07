@@ -1713,27 +1713,88 @@ typedef struct {
 } aofManifest;
 
 /*-----------------------------------------------------------------------------
- * Hotkey definition — Misra-Gries based hot key detection
+ * Hotkey definition — WavingSketch (Li et al., KDD 2020)
+ *
+ * Reference: "WavingSketch: An Unbiased and Generic Sketch for Finding Top-k
+ *            Items in Data Streams" (https://dl.acm.org/doi/10.1145/3394486.3403208)
+ *
+ * Algorithm (verbatim from §3.1 of the paper):
+ *   The sketch is a 1-D array of B buckets. Each bucket has L heavy cells
+ *   (each cell stores a key + count) and one signed counter (the "light"
+ *   counter). For each arriving key e:
+ *     1. Map e → bucket index B[h(e)] using hash h(·).
+ *     2. If e matches one of the L heavy cells of B[h(e)]:
+ *          increment that cell's count by 1.
+ *        Otherwise:
+ *          let count_min = min count among the L heavy cells of B[h(e)];
+ *          B[h(e)].counter += s(e),  where s(e) ∈ {+1,-1};
+ *          if |B[h(e)].counter| > count_min:
+ *              replace that smallest cell with e, set its count to
+ *              |B[h(e)].counter|, then reset B[h(e)].counter ← 0.
+ *
+ *   Note: there is no "free cell" special case. Cells start with count = 0
+ *   and are populated through the displacement rule above. An empty cell
+ *   (count = 0, no key) trivially has count_min = 0, so the very first
+ *   observation in a bucket immediately replaces a cell because
+ *   |±1| > 0.
+ *
+ * Hashing: the paper uses Bob Jenkins' lookup3 hash from
+ *   http://burtleburtle.net/bob/hash/evahash.html
+ * to produce two independent values per key: one for the bucket index, one
+ * for the sign. We mirror that choice here.
+ *
+ * Properties:
+ *   - Heavy-cell count is an unbiased estimator of the true frequency for
+ *     tracked keys (the ±1 sign hash makes the light counter a martingale
+ *     with mean zero for non-tracked keys).
+ *   - Robust to cold-key churn that defeats Misra-Gries / Space-Saving in
+ *     adversarial arrival orderings.
  *----------------------------------------------------------------------------*/
 
-
-/* Misra-Gries summary: parallel arrays of at most max_keys entries */
+/* One heavy cell. The `flag` bit (per Algorithm 1, §3.1 of the paper)
+ * distinguishes:
+ *   - flag = true:  the cell's frequency was incremented only by direct hits —
+ *                   `frequency` is an unbiased estimate of the true count.
+ *   - flag = false: the cell was installed via the displacement rule (the
+ *                   bucket's signed counter exceeded the previous min), so
+ *                   `frequency` carries absorbed light mass and may even be
+ *                   negative; it is an upper-bound surrogate, not the truth.
+ *
+ * `sign` caches s(e), the ±1 sign hash for this key. The paper's algorithm
+ * needs s(e_r) when an unbiased cell is displaced (line 14: light counter
+ * absorbs `f_r * s(e_r)`); caching the sign avoids re-hashing the displaced
+ * key just to recover that bit.
+ */
 typedef struct {
-    sds *keys;            /* Key names (NULL = empty slot) */
-    uint32_t *key_lens;   /* Cached key lengths for fast-reject */
-    uint64_t *counters;   /* Access count for key at position [i] */
-    uint64_t *decrements; /* Decrement count for key at position [i] */
-    int *dbs;             /* Database id for key at position [i] */
-    int *slots;           /* Hash slot for key at position [i] */
-    int max_keys;         /* Capacity (k) */
-    int size;             /* Current number of active entries */
-    uint64_t total;       /* Total observations in current window */
-} hotkeyMGSummary;
+    sds key;            /* Key name (NULL = empty cell) */
+    uint32_t key_len;   /* Cached length for fast-reject */
+    int64_t frequency;  /* Heavy frequency estimate; signed (biased cells can be <0) */
+    int dbid;           /* Database id */
+    int slot;           /* Hash slot */
+    int flag;           /* 1 = unbiased; 0 = inherited via displacement */
+    int sign;           /* s(e) ∈ {+1, -1}; cached at insert to avoid rehashing */
+} hotkeyWSCell;
 
-/* Hotkey manager: single global read + write summaries */
+/* One bucket = L cells + the bucket's signed counter (the paper's
+ * `B[h(e)].count`, sometimes called the "light" counter — sum of ±1
+ * contributions plus absorbed displaced cell mass). */
 typedef struct {
-    hotkeyMGSummary *read_summary;
-    hotkeyMGSummary *write_summary;
+    hotkeyWSCell *cells;   /* L cells per bucket */
+    int64_t count;         /* Signed bucket counter (paper's B[h(e)].count) */
+} hotkeyWSBucket;
+
+/* WavingSketch: B buckets of L cells. Total tracked top-k = B * L. */
+typedef struct {
+    hotkeyWSBucket *buckets; /* B buckets */
+    int b;                   /* Number of buckets */
+    int l;                   /* Cells per bucket */
+    uint64_t total;          /* Total observations (current window) */
+} hotkeyWS;
+
+/* Hotkey manager: single global read + write WavingSketches. */
+typedef struct {
+    hotkeyWS *read_summary;
+    hotkeyWS *write_summary;
 } hotkeyManager;
 
 /*-----------------------------------------------------------------------------
@@ -4259,8 +4320,6 @@ void hotkeysResetCommand(client *c);
 /* Hotkey (Misra-Gries) */
 int hotKeyEnabledCallback(const char **err);
 int hotKeyMaxKeysCallback(const char **err);
-hotkeyMGSummary *hotkeyMGSummaryNew(int max_keys);
-void hotkeyMGSummaryFree(hotkeyMGSummary *s);
 hotkeyManager *hotkeyManagerInit(int max_keys);
 void hotkeyManagerFree(hotkeyManager *manager);
 void hotkeyManagerReset(hotkeyManager *manager);
