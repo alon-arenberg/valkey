@@ -112,8 +112,11 @@ static void hotkeyCMSDecay(hotkeyCMS *cms, double f) {
  * Top-K min-heap tracker
  *
  * Min-ordered by count: root has the smallest count. When full and a new key
- * has a higher count than the root, evict the root. Linear scan for key
- * lookup (K is small), heap sift for structural maintenance.
+ * has a higher count than the smallest entry, replace it. The structure is a
+ * flat unordered array; both membership lookup and min-find are O(K) linear
+ * scans. K is small (default 16), so the working set fits in a couple of
+ * cache lines and dropping the heap removes per-hit reordering on the common
+ * path at the cost of an O(K) min-find on the rarer eviction path.
  * ==========================================================================*/
 
 static hotkeyTopK *hotkeyTopKNew(int capacity) {
@@ -143,40 +146,7 @@ static void hotkeyTopKReset(hotkeyTopK *tk) {
     tk->size = 0;
 }
 
-static void heapSwap(hotkeyTopK *tk, int a, int b) {
-    hotkeyTopKEntry tmp = tk->entries[a];
-    tk->entries[a] = tk->entries[b];
-    tk->entries[b] = tmp;
-}
-
-static void heapSiftUp(hotkeyTopK *tk, int idx) {
-    while (idx > 0) {
-        int parent = (idx - 1) / 2;
-        if (tk->entries[idx].count < tk->entries[parent].count) {
-            heapSwap(tk, idx, parent);
-            idx = parent;
-        } else {
-            break;
-        }
-    }
-}
-
-static void heapSiftDown(hotkeyTopK *tk, int idx) {
-    while (1) {
-        int smallest = idx;
-        int left = 2 * idx + 1;
-        int right = 2 * idx + 2;
-        if (left < tk->size && tk->entries[left].count < tk->entries[smallest].count)
-            smallest = left;
-        if (right < tk->size && tk->entries[right].count < tk->entries[smallest].count)
-            smallest = right;
-        if (smallest == idx) break;
-        heapSwap(tk, idx, smallest);
-        idx = smallest;
-    }
-}
-
-/* Find (key, dbid) index in heap by linear scan. Returns -1 if not found. */
+/* Find (key, dbid) index by linear scan. Returns -1 if not found. */
 static int hotkeyTopKFind(hotkeyTopK *tk, const char *k, size_t klen, int dbid) {
     for (int i = 0; i < tk->size; i++) {
         if (tk->entries[i].key &&
@@ -189,63 +159,83 @@ static int hotkeyTopKFind(hotkeyTopK *tk, const char *k, size_t klen, int dbid) 
     return -1;
 }
 
+/* Find the index of the active entry with the smallest count. NULL slots
+ * (left behind by decay/prune) are skipped. Returns -1 if no active entries. */
+static int hotkeyTopKMinIdx(hotkeyTopK *tk) {
+    int min_idx = -1;
+    double min_count = 0.0;
+    for (int i = 0; i < tk->size; i++) {
+        if (!tk->entries[i].key) continue;
+        if (min_idx < 0 || tk->entries[i].count < min_count) {
+            min_count = tk->entries[i].count;
+            min_idx = i;
+        }
+    }
+    return min_idx;
+}
+
+/* Find the first NULL slot in [0, capacity). Returns -1 if all slots are
+ * occupied. Used to reuse decay-pruned holes before growing `size`. */
+static int hotkeyTopKFirstFreeIdx(hotkeyTopK *tk) {
+    for (int i = 0; i < tk->size; i++) {
+        if (!tk->entries[i].key) return i;
+    }
+    if (tk->size < tk->capacity) return tk->size;
+    return -1;
+}
+
 static void hotkeyTopKAdd(hotkeyTopK *tk, robj *key, double count, int dbid, int slot) {
     sds k = objectGetVal(key);
     size_t klen = sdslen(k);
 
-    /* (Key, dbid) already in heap — update count and fix heap order */
+    /* (Key, dbid) already tracked — update count in place. */
     int idx = hotkeyTopKFind(tk, k, klen, dbid);
     if (idx >= 0) {
         tk->entries[idx].count = count;
-        tk->entries[idx].dbid = dbid;
         tk->entries[idx].slot = slot;
-        heapSiftDown(tk, idx);
         return;
     }
 
-    /* Room available — insert at end and sift up */
-    if (tk->size < tk->capacity) {
-        idx = tk->size;
-        tk->entries[idx].key = sdsnewlen(k, klen);
-        tk->entries[idx].count = count;
-        tk->entries[idx].dbid = dbid;
-        tk->entries[idx].slot = slot;
-        tk->size++;
-        heapSiftUp(tk, idx);
+    /* Reuse a NULL slot if any (gap from a previous decay-prune), or grow
+     * `size` if there's room past the high-water mark. */
+    int free_idx = hotkeyTopKFirstFreeIdx(tk);
+    if (free_idx >= 0) {
+        if (free_idx == tk->size) tk->size++;
+        tk->entries[free_idx].key = sdsnewlen(k, klen);
+        tk->entries[free_idx].count = count;
+        tk->entries[free_idx].dbid = dbid;
+        tk->entries[free_idx].slot = slot;
         return;
     }
 
-    /* Full — evict root if new count is larger */
-    if (count > tk->entries[0].count) {
-        sdsfree(tk->entries[0].key);
-        tk->entries[0].key = sdsnewlen(k, klen);
-        tk->entries[0].count = count;
-        tk->entries[0].dbid = dbid;
-        tk->entries[0].slot = slot;
-        heapSiftDown(tk, 0);
+    /* Full — replace the entry with the smallest count if the new count
+     * exceeds it. */
+    int min_idx = hotkeyTopKMinIdx(tk);
+    if (min_idx >= 0 && count > tk->entries[min_idx].count) {
+        sdsfree(tk->entries[min_idx].key);
+        tk->entries[min_idx].key = sdsnewlen(k, klen);
+        tk->entries[min_idx].count = count;
+        tk->entries[min_idx].dbid = dbid;
+        tk->entries[min_idx].slot = slot;
     }
 }
 
-/* Decay every heap entry by f, drop entries that fade below the eviction
- * floor, then re-establish the min-heap invariant. */
+/* Decay every entry by f and drop entries that fade below the eviction floor.
+ * Pruned slots are left as NULL gaps; subsequent inserts will reuse them.
+ * `size` stays as a high-water mark of touched indices, not active count. */
 static void hotkeyTopKDecayAndPrune(hotkeyTopK *tk, double f) {
     if (!tk) return;
-    int w = 0;
     for (int i = 0; i < tk->size; i++) {
         if (!tk->entries[i].key) continue;
         double c = tk->entries[i].count * f;
         if (c < HOTKEY_MIN_COUNT) {
             sdsfree(tk->entries[i].key);
             tk->entries[i].key = NULL;
+            tk->entries[i].count = 0;
             continue;
         }
-        tk->entries[w] = tk->entries[i];
-        tk->entries[w].count = c;
-        w++;
+        tk->entries[i].count = c;
     }
-    tk->size = w;
-    /* Re-heapify the compacted array (min-heap). */
-    for (int i = tk->size / 2 - 1; i >= 0; i--) heapSiftDown(tk, i);
 }
 
 /* ===========================================================================
