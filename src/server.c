@@ -2974,6 +2974,8 @@ void resetServerStats(void) {
     server.stat_io_writes_processed = 0;
     server.stat_io_freed_objects = 0;
     server.stat_io_accept_offloaded = 0;
+    server.stat_io_accept_syscall_offloaded = 0;
+    server.stat_io_accept_syscall_jobs = 0;
     server.stat_poll_processed_by_io_threads = 0;
     server.stat_total_writes_processed = 0;
     server.stat_client_qbuf_limit_disconnections = 0;
@@ -6972,6 +6974,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "io_threaded_writes_processed:%lld\r\n", server.stat_io_writes_processed,
                 "io_threaded_freed_objects:%lld\r\n", server.stat_io_freed_objects,
                 "io_threaded_accept_processed:%lld\r\n", server.stat_io_accept_offloaded,
+                "io_threaded_accept_syscall_processed:%lld\r\n", server.stat_io_accept_syscall_offloaded,
+                "io_threaded_accept_syscall_jobs:%lld\r\n", server.stat_io_accept_syscall_jobs,
                 "io_threaded_poll_processed:%lld\r\n", server.stat_poll_processed_by_io_threads,
                 "io_threaded_total_prefetch_batches:%lld\r\n", server.stat_total_prefetch_batches,
                 "io_threaded_total_prefetch_entries:%lld\r\n", server.stat_total_prefetch_entries,

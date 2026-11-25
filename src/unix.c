@@ -26,6 +26,7 @@
 
 #include "server.h"
 #include "connection.h"
+#include "io_threads.h"
 
 static ConnectionType CT_Unix;
 
@@ -105,7 +106,8 @@ static void connUnixAcceptHandler(aeEventLoop *el, int fd, void *privdata, int m
     flags.unix_socket = 1;
     UNUSED(el);
     UNUSED(mask);
-    UNUSED(privdata);
+
+    if (trySendAcceptSyscallToIOThreads(privdata, fd, NULL, 1, max) == C_OK) return;
 
     while (max--) {
         cfd = anetUnixAccept(server.neterr, fd);

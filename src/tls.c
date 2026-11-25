@@ -1694,7 +1694,10 @@ static void tlsAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) 
     struct ClientFlags flags = {0};
     UNUSED(el);
     UNUSED(mask);
-    UNUSED(privdata);
+
+    /* Offloads accept() only. The TLS handshake that follows is offloaded
+     * separately, per connection, by trySendAcceptToIOThreads(). */
+    if (trySendAcceptSyscallToIOThreads(privdata, fd, &server.tls_auth_clients, 0, max) == C_OK) return;
 
     while (max--) {
         cfd = anetTcpAccept(server.neterr, fd, cip, sizeof(cip), &cport);

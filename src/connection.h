@@ -194,6 +194,8 @@ struct connection {
 
 #define CONFIG_BINDADDR_MAX 16
 
+struct acceptIOJob;
+
 /* Set up a listener by a connection type */
 struct connListener {
     int fd[CONFIG_BINDADDR_MAX];
@@ -203,6 +205,12 @@ struct connListener {
     int port;
     ConnectionType *ct;
     void *priv; /* used by connection type specified data */
+    /* Accept offload state, one entry per listening socket in fd[]. Allocated
+     * the first time this listener hands an accept() to an I/O thread, and
+     * kept for the life of the listener so a response that is still queued
+     * always has its slot. See trySendAcceptSyscallToIOThreads(). */
+    struct acceptIOJob *accept_jobs;
+    int accept_jobs_count;
 };
 
 /* The connection module does not deal with listening and accepting sockets,

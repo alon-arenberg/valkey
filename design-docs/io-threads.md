@@ -249,13 +249,82 @@ Key design decisions:
 `cluster_io_threaded_accepts_processed` (all counted when a worker job
 completes) and `cluster_io_main_thread_fallbacks`.
 
+## Accept Offload (POC)
+
+`io-threads-accept-offload` (off by default) moves the `accept()` syscall off
+the main thread. Without it, every new connection is accepted and admitted
+inline on the main thread inside the listener's readable handler, which makes
+the main thread the bottleneck during a connection burst.
+
+### What moves and what does not
+
+The split follows the usual rule: a worker may touch only the socket it has just
+accepted, which nothing else can see yet.
+
+| Step | Thread | Why |
+|---|---|---|
+| `accept4()` on the listening socket | worker | the socket is the only shared thing, and the kernel serializes it |
+| `TCP_NODELAY`, `SO_KEEPALIVE` | worker | setsockopt on the new socket |
+| `connCreateAccepted()` | main | allocation only, but see the next increment |
+| admission control (`maxclients`, priority subnets) | main | reads the client list, writes the rejection counters |
+| `createClient()` | main | mutates the event loop, `server.clients` and the client id index |
+| `connAccept()` → `clientAcceptHandler()` | main | protected-mode checks, connection counters, module events |
+
+### Queue routing
+
+The request rides the **per-worker SPSC inbox** (`JOB_SPSC_ACCEPT`), not the
+shared SPMC inbox. The SPMC tag enum already uses all eight values the 3-bit tag
+can hold, and widening it would change the pointer-alignment assumption
+everywhere. The cost is that the job waits on one chosen worker rather than the
+first free one, so the target rotates. The completion rides the normal MPSC
+outbox as `JOB_RES_ACCEPT_SYSCALL`.
+
+### Per-listener job
+
+One `acceptIOJob` per listening socket, allocated on the listener the first time
+it offloads and kept for the listener's life. It holds a fixed
+`IO_ACCEPT_BATCH_MAX` result array, so no allocation happens per event.
+
+While a job is in flight the main thread **removes `AE_READABLE` on that
+listening socket**. Otherwise a socket whose backlog is not empty stays readable
+and the event loop spins on it while a worker is already draining it. The
+completion handler re-arms it; because epoll is level triggered, a backlog that
+the batch cap cut short refires on the next poll.
+
+### Listener close
+
+`cancelListenerAcceptOffload()` runs before a listener's sockets are closed. It
+waits for any in-flight job to publish its results, then closes the sockets it
+accepted. The wait matters: closing the listening socket while a worker sits in
+`accept()` could hand that worker a recycled fd number.
+
+The job's `in_flight` flag deliberately stays set until its response is
+consumed, so a re-created listener cannot hand the same slot to a second worker
+while the first response is still queued. Until that response drains, the
+listener accepts inline.
+
+### Known gaps
+
+- Between `accept4()` on the worker and `createClient()` on the main thread, an
+  accepted socket has no owner. If the process dies in that window the fd is
+  lost with it, which is harmless, but it is not tracked anywhere.
+- At process exit a worker can be cancelled inside `accept()`, since `accept()`
+  is a POSIX cancellation point. The socket leaks into the dying process. Live
+  reconfiguration is unaffected: it drains the queues before joining a worker.
+- Workers read `server.tcpkeepalive` without synchronization, as other worker
+  paths already do.
+- RDMA keeps the inline accept path.
+
 ## Relevant Code
 
 - `src/io_threads.{c,h}` — main thread dispatch helpers, worker loop,
-  scaling policy.
+  scaling policy, accept offload (`trySendAcceptSyscallToIOThreads`,
+  `ioThreadAcceptSyscall`, `cancelListenerAcceptOffload`).
 - `src/queues.{c,h}` — SPMC, MPSC, and SPSC queue primitives.
 - `src/networking.c` — client read/write handlers invoked from worker job
   dispatch (`ioThreadReadQueryFromClient`, `ioThreadWriteToClient`).
+- `src/socket.c`, `src/unix.c`, `src/tls.c` — listener accept handlers that
+  hand their backlog to a worker before falling back to the inline loop.
 - `src/cluster_legacy.c` — cluster bus worker jobs (`clusterReadJob`,
   `clusterWriteJob`, `clusterAcceptJob`) and their main-thread completions
   (`clusterHandleReadCompletion`, `clusterHandleWriteCompletion`,

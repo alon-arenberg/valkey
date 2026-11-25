@@ -1,3 +1,5 @@
+source tests/support/cli.tcl
+
 proc wait_for_io_threads_to_go_idle {} {
     set io_threads_always_active [dict get [r config get io-threads-always-active] io-threads-always-active]
     if {$io_threads_always_active eq {yes}} {
@@ -168,6 +170,120 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
         assert_error "ERR wrong number of arguments*" {$rd read}
         $rd close
 
+        assert_equal {PONG} [r ping]
+    }
+}
+
+proc accept_offload_count {} {
+    return [getInfoProperty [r info stats] io_threaded_accept_syscall_processed]
+}
+
+start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {io-threads 5}} {
+    test {Accept offload: IO threads run accept() for new connections} {
+        assert_equal {OK} [r config set io-threads-always-active yes]
+        assert_equal {OK} [r config set io-threads-accept-offload yes]
+        activate_io_threads_and_wait
+
+        # A throwaway connection brings the pool back up before we count.
+        set warm [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+        assert_equal {PONG} [$warm ping]
+        $warm close
+
+        set before [accept_offload_count]
+        set clients {}
+        for {set i 0} {$i < 50} {incr i} {
+            set rd [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+            assert_equal {PONG} [$rd ping]
+            lappend clients $rd
+        }
+        # A client that answered PING was accepted, linked and served, so the
+        # counter is already up to date; no waiting needed.
+        assert_equal [expr {[accept_offload_count] - $before}] 50
+
+        # The offloaded clients keep working after the accept batch.
+        foreach rd $clients {
+            assert_equal {PONG} [$rd ping]
+            $rd close
+        }
+        assert_equal {PONG} [r ping]
+    }
+
+    test {Accept offload: unix socket connections are offloaded too} {
+        assert_equal {OK} [r config set io-threads-accept-offload yes]
+        set before [accept_offload_count]
+        # The tcl client speaks TCP only, so reach the unix listener (a
+        # different accept path) through valkey-cli.
+        assert_equal {PONG} [lindex [valkeycli_exec 0 ping] 0]
+        assert_morethan [accept_offload_count] $before
+        assert_equal {PONG} [r ping]
+    }
+
+    test {Accept offload: maxclients is still enforced} {
+        assert_equal {OK} [r config set io-threads-accept-offload yes]
+        set rejected_before [getInfoProperty [r info stats] rejected_connections]
+        set connected [getInfoProperty [r info clients] connected_clients]
+
+        # Leave room for the connections already open and none for new ones, so
+        # the admission check on the main thread has to reject clients a worker
+        # may already have allocated.
+        assert_equal {OK} [r config set maxclients $connected]
+        set failures 0
+        for {set i 0} {$i < 10} {incr i} {
+            if {[catch {
+                set rd [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+                $rd ping
+                $rd close
+            }]} {
+                incr failures
+            }
+        }
+        assert_morethan $failures 0
+        assert_morethan [getInfoProperty [r info stats] rejected_connections] $rejected_before
+
+        assert_equal {OK} [r config set maxclients 10000]
+        set rd [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+        assert_equal {PONG} [$rd ping]
+        $rd close
+        assert_equal {PONG} [r ping]
+    }
+
+    test {Accept offload: the listener can be re-created while accepts are offloaded} {
+        assert_equal {OK} [r config set io-threads-accept-offload yes]
+        if {$::tls} { set port_cfg tls-port } else { set port_cfg port }
+        set old_port [lindex [r config get $port_cfg] 1]
+        set new_port [find_available_port $::baseport $::portcount]
+
+        # Keep the listener busy so a job is likely in flight when it closes.
+        for {set i 0} {$i < 20} {incr i} {
+            set rd [valkey [srv 0 host] $old_port 0 $::tls]
+            $rd ping
+            $rd close
+        }
+
+        assert_equal {OK} [r config set $port_cfg $new_port]
+        set rd [valkey [srv 0 host] $new_port 0 $::tls]
+        assert_equal {PONG} [$rd ping]
+        $rd close
+
+        assert_equal {OK} [r config set $port_cfg $old_port]
+        set rd [valkey [srv 0 host] $old_port 0 $::tls]
+        assert_equal {PONG} [$rd ping]
+        $rd close
+    }
+
+    test {Accept offload: falls back to the main thread when io-threads is 1} {
+        assert_equal {OK} [r config set io-threads 1]
+        wait_for_io_threads_to_go_idle
+        assert_equal {OK} [r config set io-threads-accept-offload yes]
+
+        set before [accept_offload_count]
+        set rd [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+        assert_equal {PONG} [$rd ping]
+        $rd close
+        # No worker pool, so the accept stays inline.
+        assert_equal [accept_offload_count] $before
+
+        assert_equal {OK} [r config set io-threads 5]
         assert_equal {PONG} [r ping]
     }
 }

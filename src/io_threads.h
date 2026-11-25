@@ -12,6 +12,7 @@
 typedef enum {
     JOB_SPSC_FREE_ARGV = 0,
     JOB_SPSC_POLL = 1,
+    JOB_SPSC_ACCEPT = 2,
 } JobRequestSPSC;
 
 /* Tags for the SPMC shared inbox (main thread → any I/O thread). */
@@ -35,9 +36,47 @@ typedef enum {
     JOB_RES_CLUSTER_READ,
     JOB_RES_CLUSTER_WRITE,
     JOB_RES_CLUSTER_ACCEPT,
+    JOB_RES_ACCEPT_SYSCALL,
     JOB_RES_COUNT
 } JobResult;
 static_assert(JOB_RES_COUNT <= 8, "JOB_RES_COUNT must not exceed 8 for pointer arithmetic");
+
+/* Accept offload: one job per listening socket.
+ *
+ * The worker drains the socket's backlog into results[] with accept4() and
+ * does the per-socket setup that touches nothing shared. The main thread turns
+ * each result into a client, because admission control, createClient() and
+ * connAccept() all mutate server state.
+ *
+ * results[] is a fixed array so the job needs no allocation per event. A
+ * backlog deeper than the cap is not lost: epoll is level triggered, so
+ * re-arming the listener after a saturated batch refires immediately. */
+#define IO_ACCEPT_BATCH_MAX 32
+
+typedef struct acceptIOResult {
+    int fd;                  /* the accepted socket */
+    int port;                /* peer port, 0 for unix sockets */
+    char ip[NET_IP_STR_LEN]; /* peer address, empty for unix sockets */
+} acceptIOResult;
+
+typedef struct acceptIOJob {
+    /* Main thread owns these. Stable while the job is in flight. */
+    connListener *listener;
+    int listen_fd;
+    void *accept_priv; /* passed to ct->conn_create_accepted() */
+    int unix_socket;   /* 1: no peer address, no keepalive */
+    int max_per_cycle; /* accept() attempts allowed for one job */
+    int in_flight;     /* queued or running; cleared when the response lands */
+    int discard;       /* listener closed under the job: drop its response */
+
+    /* Worker writes these, main thread reads them after `done` is set or after
+     * the response is dequeued. */
+    _Atomic int done;
+    int accepted;
+    int saturated; /* hit the batch cap, the backlog may hold more */
+    int err_errno; /* errno that ended the accept loop, 0 if none */
+    acceptIOResult results[IO_ACCEPT_BATCH_MAX];
+} acceptIOJob;
 
 typedef void (*job_handler)(void *);
 
@@ -60,6 +99,12 @@ const void *testOnlyGetIOJobsFinishedCounter(void);
 const void *testOnlyGetIOJobsSubmittedCounter(void);
 void trySendPollJobToIOThreads(void);
 int trySendAcceptToIOThreads(connection *conn);
+int trySendAcceptSyscallToIOThreads(connListener *listener,
+                                    int listen_fd,
+                                    void *accept_priv,
+                                    int unix_socket,
+                                    int max_per_cycle);
+void cancelListenerAcceptOffload(connListener *listener);
 struct clusterLink;
 int trySendClusterReadToIOThreads(struct clusterLink *link);
 int trySendClusterWriteToIOThreads(struct clusterLink *link);

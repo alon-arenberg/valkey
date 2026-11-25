@@ -1979,6 +1979,7 @@ struct valkeyServer {
     int io_threads_num;                       /* Number of IO threads to use. */
     int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
+    int io_threads_accept_offload;            /* Offload the accept() syscall to IO threads. */
     int prefetch_batch_max_size;              /* Maximum number of keys to prefetch in a single batch */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */
     int enable_protected_configs;             /* Enable the modification of protected configs, see PROTECTED_ACTION_ALLOWED_* */
@@ -2077,6 +2078,8 @@ struct valkeyServer {
     long long stat_io_writes_pending;                  /* Number of write events pending in IO threads */
     long long stat_io_freed_objects;                   /* Number of objects freed by IO threads */
     long long stat_io_accept_offloaded;                /* Number of offloaded accepts */
+    long long stat_io_accept_syscall_offloaded;        /* Connections accept()ed by IO threads */
+    long long stat_io_accept_syscall_jobs;             /* Accept-syscall jobs handed to IO threads */
     long long stat_poll_processed_by_io_threads;       /* Total number of poll jobs processed by IO */
     long long stat_total_reads_processed;              /* Total number of read events processed */
     long long stat_total_writes_processed;             /* Total number of write events processed */

@@ -57,6 +57,11 @@ typedef struct {
 static_assert(sizeof(io_jobs_finished_counter) == CACHE_LINE_SIZE, "io_jobs_finished must occupy exactly one cache line");
 static io_jobs_finished_counter io_jobs_finished;
 static size_t cluster_io_pending_responses;
+/* Accept offload jobs handed to workers whose response the main thread has not
+ * consumed yet. Counted with the read/write pending counters so poll offload,
+ * response draining and live reconfiguration all see the job. */
+static size_t accept_syscall_pending_responses;
+static int cur_accept_thread = 0;
 static int io_threads_initialized = 0;
 /* Set during process exit to stop worker response retries. */
 static _Atomic int io_threads_exiting = 0;
@@ -94,6 +99,8 @@ void ioThreadWriteToClient(client *c);
 void ioThreadFreeArgv(robj **argv);
 void ioThreadPoll(aeEventLoop *el);
 static void ioThreadAccept(client *c);
+static void ioThreadAcceptSyscall(acceptIOJob *job);
+static void handleAcceptSyscallJob(acceptIOJob *job);
 
 int inMainThread(void) {
     return thread_id == 0;
@@ -116,7 +123,8 @@ static size_t getPendingIOThreadsJobs(void) {
 
 /* Read/write jobs awaiting response from IO threads. */
 static size_t getPendingIOResponsesCount(void) {
-    return server.stat_io_writes_pending + server.stat_io_reads_pending + cluster_io_pending_responses;
+    return server.stat_io_writes_pending + server.stat_io_reads_pending + cluster_io_pending_responses +
+           accept_syscall_pending_responses;
 }
 
 /* Drains the I/O threads queue by waiting for all jobs to be processed.
@@ -414,6 +422,9 @@ static void *IOThreadMain(void *myid) {
                 case JOB_SPSC_POLL:
                     ioThreadPoll((aeEventLoop *)data);
                     break;
+                case JOB_SPSC_ACCEPT:
+                    ioThreadAcceptSyscall((acceptIOJob *)data);
+                    break;
                 default:
                     serverPanic("Invalid SPSC job type: %d", type);
                 }
@@ -523,6 +534,15 @@ static void shutdownIOThread(int id) {
                 case JOB_SPSC_POLL:
                     serverAssert(atomic_load_explicit(&io_threads_exiting, memory_order_acquire));
                     break;
+                case JOB_SPSC_ACCEPT:
+                    /* Only reachable at process exit: live reconfiguration drains
+                     * the queues before joining a worker. The accept never ran,
+                     * so there is nothing to clean up beyond the bookkeeping. */
+                    serverAssert(atomic_load_explicit(&io_threads_exiting, memory_order_acquire));
+                    serverAssert(accept_syscall_pending_responses > 0);
+                    accept_syscall_pending_responses--;
+                    ((acceptIOJob *)data)->in_flight = 0;
+                    break;
                 default:
                     serverPanic("Invalid SPSC job type: %d", type);
                 }
@@ -613,6 +633,7 @@ void initIOThreads(int prev_threads_num) {
         io_jobs_submitted = 0;
         atomic_init(&io_jobs_finished.value, 0);
         cluster_io_pending_responses = 0;
+    accept_syscall_pending_responses = 0;
         prefetchCommandsBatchInit();
         io_threads_initialized = 1;
     }
@@ -638,6 +659,7 @@ void testOnlyInitIOThreadQueues(void) {
     io_jobs_submitted = 0;
     atomic_store_explicit(&io_jobs_finished.value, 0, memory_order_relaxed);
     cluster_io_pending_responses = 0;
+    accept_syscall_pending_responses = 0;
 }
 
 void testOnlyFreeIOThreadQueues(void) {
@@ -653,6 +675,7 @@ void testOnlyFreeIOThreadQueues(void) {
     io_jobs_submitted = 0;
     atomic_store_explicit(&io_jobs_finished.value, 0, memory_order_relaxed);
     cluster_io_pending_responses = 0;
+    accept_syscall_pending_responses = 0;
 }
 
 /* Fill the shared inbox so the next dispatch has to take its enqueue-failure
@@ -1160,6 +1183,200 @@ static void ioThreadAccept(client *c) {
     sendToMainThread(c, JOB_RES_READ_CLIENT);
 }
 
+/* Worker side of the accept() offload: drain one listening socket's backlog
+ * into the job's result array.
+ *
+ * Only the socket itself is touched here. anetTcpAccept() does accept4() plus
+ * TCP_NODELAY, and anetKeepAlive() is a setsockopt on the socket we just got,
+ * so neither reads nor writes shared server state. Everything that does -
+ * admission control, createClient(), connAccept() - is left to the main thread
+ * in handleAcceptSyscallJob().
+ *
+ * Errors are reported back as an errno rather than logged, because serverLog()
+ * is not for workers. */
+static void ioThreadAcceptSyscall(acceptIOJob *job) {
+    char err[ANET_ERR_LEN];
+    /* Read the config once: it can change under us, and a per-job snapshot
+     * keeps the whole batch consistent. */
+    int keepalive = server.tcpkeepalive;
+    int attempts = job->max_per_cycle;
+
+    while (attempts-- > 0 && job->accepted < job->max_per_cycle) {
+        acceptIOResult *r = &job->results[job->accepted];
+        int cfd;
+
+        if (job->unix_socket) {
+            r->ip[0] = '\0';
+            r->port = 0;
+            cfd = anetUnixAccept(err, job->listen_fd);
+        } else {
+            cfd = anetTcpAccept(err, job->listen_fd, r->ip, sizeof(r->ip), &r->port);
+        }
+
+        if (cfd == ANET_ERR) {
+            /* A connection aborted between SYN and accept() costs an attempt
+             * but no result slot, same as the inline accept loop. */
+            if (anetRetryAcceptOnError(errno)) continue;
+            job->err_errno = errno;
+            break;
+        }
+
+        if (!job->unix_socket && keepalive) anetKeepAlive(NULL, cfd, keepalive);
+        r->fd = cfd;
+        job->accepted++;
+    }
+
+    if (job->accepted == job->max_per_cycle) job->saturated = 1;
+
+    /* Publish the results before the response, so cancelListenerAcceptOffload()
+     * can read them without going through the queue. */
+    atomic_store_explicit(&job->done, 1, memory_order_release);
+    sendToMainThread(job, JOB_RES_ACCEPT_SYSCALL);
+}
+
+/* Main thread: turn the sockets a worker accepted into clients, then re-arm the
+ * listener. */
+static void handleAcceptSyscallJob(acceptIOJob *job) {
+    serverAssert(inMainThread());
+    serverAssert(accept_syscall_pending_responses > 0);
+    accept_syscall_pending_responses--;
+    serverAssert(job->in_flight);
+    job->in_flight = 0;
+
+    /* The listener was closed while the job was in flight. The accepted
+     * sockets are already closed and the listening socket is gone, so there is
+     * nothing to admit and nothing to re-arm. */
+    if (job->discard) {
+        job->discard = 0;
+        return;
+    }
+
+    struct ClientFlags flags = {0};
+    if (job->unix_socket) flags.unix_socket = 1;
+
+    for (int i = 0; i < job->accepted; i++) {
+        acceptIOResult *r = &job->results[i];
+        if (job->unix_socket) {
+            serverLog(LL_VERBOSE, "Accepted connection to %s", server.unixsocket);
+        } else {
+            serverLog(LL_VERBOSE, "Accepted %s:%d", r->ip, r->port);
+        }
+        acceptCommonHandler(connCreateAccepted(job->listener->ct, r->fd, job->accept_priv), flags,
+                            job->unix_socket ? NULL : r->ip);
+    }
+    server.stat_io_accept_syscall_offloaded += job->accepted;
+
+    if (job->err_errno && job->err_errno != EWOULDBLOCK) {
+        serverLog(LL_WARNING, "Accepting client connection: accept: %s", strerror(job->err_errno));
+    }
+
+    /* Re-arm the listener. epoll is level triggered, so a backlog the batch cap
+     * cut short refires on the next poll and the next job drains the rest. */
+    if (aeCreateFileEvent(server.el, job->listen_fd, AE_READABLE, job->listener->ct->accept_handler, job->listener) ==
+        AE_ERR) {
+        serverLog(LL_WARNING, "Error re-arming the accept handler for listening fd %d, port %d", job->listen_fd,
+                  job->listener->port);
+    }
+}
+
+/* Hand the accept() syscall for one listening socket to an I/O thread.
+ *
+ * The listener's readable event is removed for the duration of the job. Without
+ * that, a socket whose backlog is not empty stays readable and the event loop
+ * would spin on it while the worker is already draining it.
+ *
+ * The job goes to one worker's private queue rather than the shared inbox: the
+ * shared inbox tags all eight values a 3-bit tag can hold, and widening that
+ * would change the pointer-alignment assumption everywhere. The cost is that
+ * the accept waits on the chosen worker instead of the first free one, which
+ * is why the target rotates.
+ *
+ * Returns C_OK when a worker owns the socket and the caller must not accept
+ * itself, C_ERR when the caller should accept inline as before. */
+int trySendAcceptSyscallToIOThreads(connListener *listener,
+                                    int listen_fd,
+                                    void *accept_priv,
+                                    int unix_socket,
+                                    int max_per_cycle) {
+    serverAssert(inMainThread());
+    if (!server.io_threads_accept_offload) return C_ERR;
+    if (server.active_io_threads_num <= 1) return C_ERR;
+    if (listener->count <= 0) return C_ERR;
+
+    if (listener->accept_jobs == NULL) {
+        listener->accept_jobs = zcalloc(sizeof(acceptIOJob) * listener->count);
+        listener->accept_jobs_count = listener->count;
+    }
+
+    /* One slot per listening socket, so two sockets of the same listener can be
+     * drained at once. */
+    acceptIOJob *job = NULL;
+    for (int j = 0; j < listener->accept_jobs_count && j < listener->count; j++) {
+        if (listener->fd[j] == listen_fd) {
+            job = &listener->accept_jobs[j];
+            break;
+        }
+    }
+    /* The listener was re-created with a different socket set and the slot for
+     * this fd is still held by an unconsumed response. Accept inline. */
+    if (job == NULL) return C_ERR;
+    if (job->in_flight) return C_ERR;
+
+    int tid = (cur_accept_thread % (server.active_io_threads_num - 1)) + 1;
+    if (spscIsFull(&io_private_inbox[tid])) return C_ERR;
+    cur_accept_thread = tid;
+
+    job->listener = listener;
+    job->listen_fd = listen_fd;
+    job->accept_priv = accept_priv;
+    job->unix_socket = unix_socket;
+    job->max_per_cycle = max_per_cycle < IO_ACCEPT_BATCH_MAX ? max_per_cycle : IO_ACCEPT_BATCH_MAX;
+    if (job->max_per_cycle < 1) job->max_per_cycle = 1;
+    job->accepted = 0;
+    job->saturated = 0;
+    job->err_errno = 0;
+    job->discard = 0;
+    atomic_store_explicit(&job->done, 0, memory_order_relaxed);
+    job->in_flight = 1;
+
+    aeDeleteFileEvent(server.el, listen_fd, AE_READABLE);
+
+    spscEnqueue(&io_private_inbox[tid], tagJob(job, JOB_SPSC_ACCEPT), true);
+    io_jobs_submitted++;
+    accept_syscall_pending_responses++;
+    server.stat_io_accept_syscall_jobs++;
+    return C_OK;
+}
+
+/* Main thread, called before a listener's sockets are closed.
+ *
+ * A worker may be inside accept() on a socket we are about to close. Closing it
+ * first would let the fd number be recycled under the worker, so wait for the
+ * job to publish its results, then close the sockets it accepted - they can
+ * never become clients now that the listener is going away.
+ *
+ * in_flight stays set: the response is still queued, and clearing the flag here
+ * would let a re-created listener hand the same slot to a second worker while
+ * the first response is outstanding. */
+void cancelListenerAcceptOffload(connListener *listener) {
+    serverAssert(inMainThread());
+    if (listener->accept_jobs == NULL) return;
+
+    for (int j = 0; j < listener->accept_jobs_count; j++) {
+        acceptIOJob *job = &listener->accept_jobs[j];
+        if (!job->in_flight || job->discard) continue;
+
+        while (!atomic_load_explicit(&job->done, memory_order_acquire)) {
+            /* Spin: the job is bounded by max_per_cycle accept() calls, and a
+             * listener close is a config change or shutdown, not a hot path. */
+        }
+
+        for (int i = 0; i < job->accepted; i++) close(job->results[i].fd);
+        job->accepted = 0;
+        job->discard = 1;
+    }
+}
+
 /*
  * Attempts to offload an Accept operation (currently used for TLS accept) for a client
  * connection to I/O threads.
@@ -1306,6 +1523,8 @@ static int processOutboxBatch(mpscQueue *outbox) {
                 cluster_io_pending_responses--;
                 server.stat_cluster_threaded_accepts_processed++;
                 clusterHandleAcceptCompletion((connection *)data);
+            } else if (job_type == JOB_RES_ACCEPT_SYSCALL) {
+                handleAcceptSyscallJob((acceptIOJob *)data);
             } else {
                 serverPanic("Unknown job type %d", job_type);
             }

@@ -335,7 +335,10 @@ static void connSocketAcceptHandler(aeEventLoop *el, int fd, void *privdata, int
     char cip[NET_IP_STR_LEN];
     UNUSED(el);
     UNUSED(mask);
-    UNUSED(privdata);
+
+    /* Let an I/O thread drain the backlog. On C_OK it owns the listening
+     * socket until its results come back to the main thread. */
+    if (trySendAcceptSyscallToIOThreads(privdata, fd, NULL, 0, max) == C_OK) return;
 
     while (max--) {
         cfd = anetTcpAccept(server.neterr, fd, cip, sizeof(cip), &cport);
@@ -372,6 +375,9 @@ static int connSocketListen(connListener *listener) {
 
 static void connSocketCloseListener(connListener *listener) {
     int j;
+
+    /* A worker may be inside accept() on one of these sockets. */
+    cancelListenerAcceptOffload(listener);
 
     for (j = 0; j < listener->count; j++) {
         if (listener->fd[j] == -1) continue;
