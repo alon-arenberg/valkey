@@ -328,20 +328,31 @@ static int isCopyAvoidPreferred(client *c, robj *obj) {
     return server.min_string_size_copy_avoid_threaded && sdslen(objectGetVal(obj)) >= (size_t)server.min_string_size_copy_avoid_threaded;
 }
 
-client *createClient(connection *conn) {
+/* Allocate a client and initialize everything that belongs to the client alone.
+ *
+ * Nothing here touches the event loop, the client list or the client id index,
+ * and the only server state it reads is either stable for the life of the
+ * process or atomic. That makes it safe for an I/O thread to run on a
+ * connection it has just accepted and that nothing else can see yet, which is
+ * what moves the 16k reply buffer and the client allocation off the main
+ * thread during a connection burst.
+ *
+ * The client is not usable until attachClient() publishes it, and only the main
+ * thread may do that. Use freeUnattachedClient() to release a client that never
+ * got that far.
+ *
+ * Passing conn == NULL creates a client with no connection, which the command
+ * machinery needs for contexts such as Lua scripts and AOF loading. */
+client *createClientUnattached(connection *conn) {
     client *c = zmalloc(sizeof(client));
 
-    /* passing NULL as conn it is possible to create a non connected client.
-     * This is useful since all the commands needs to be executed
-     * in the context of a client. When commands are executed in other
-     * contexts (for instance a Lua script) we need a non connected client. */
     if (conn) {
-        connSetReadHandler(conn, readQueryFromClient);
         connSetPrivateData(conn, c);
         conn->flags |= CONN_FLAG_ALLOW_ACCEPT_OFFLOAD;
     }
     c->buf = zmalloc_usable(PROTO_REPLY_CHUNK_BYTES, &c->buf_usable_size);
-    selectDb(c, 0);
+    /* Left for attachClient(): selectDb() can create a database. */
+    c->db = NULL;
     uint64_t client_id = atomic_fetch_add_explicit(&server.next_client_id, 1, memory_order_relaxed);
     c->id = client_id;
 #ifdef LOG_REQ_RES
@@ -417,7 +428,6 @@ client *createClient(connection *conn) {
     listInitNode(&c->clients_pending_write_node, c);
     c->mem_usage_bucket = NULL;
     c->mem_usage_bucket_node = NULL;
-    if (conn) linkClient(c);
     c->net_input_bytes = 0;
     c->net_input_bytes_curr_cmd = 0;
     c->net_output_bytes = 0;
@@ -429,6 +439,38 @@ client *createClient(connection *conn) {
     c->io_last_written.buf = NULL;
     c->io_last_written.bufpos = 0;
     c->io_last_written.data_len = 0;
+    return c;
+}
+
+/* Publish a client built by createClientUnattached(): select its database and,
+ * for a connected client, install the read handler and add the client to the
+ * client list and the id index.
+ *
+ * Main thread only. Every step here mutates state the main thread owns, which
+ * is why this half cannot be offloaded. */
+void attachClient(client *c) {
+    selectDb(c, 0);
+    if (c->conn) {
+        /* Install the handler last: once the event is armed the client must be
+         * fully initialized. */
+        connSetReadHandler(c->conn, readQueryFromClient);
+        linkClient(c);
+    }
+}
+
+/* Release a client that createClientUnattached() built but attachClient() never
+ * published, so none of the unlinking freeClient() does applies. Only the reply
+ * buffer and the reply list have been allocated at that point. */
+void freeUnattachedClient(client *c) {
+    serverAssert(c->client_list_node == NULL);
+    zfree(c->buf);
+    listRelease(c->reply);
+    zfree(c);
+}
+
+client *createClient(connection *conn) {
+    client *c = createClientUnattached(conn);
+    attachClient(c);
     return c;
 }
 
@@ -2072,8 +2114,16 @@ static bool hasMaxClientsLimitReached(bool is_prioritized) {
 }
 
 void acceptCommonHandler(connection *conn, struct ClientFlags flags, char *ip) {
-    client *c;
+    acceptCommonHandlerWithClient(conn, flags, ip, NULL);
+}
 
+/* Admit a freshly accepted connection and turn it into a client.
+ *
+ * `c` is a client an I/O thread already built for this connection with
+ * createClientUnattached(), or NULL to build one here. Handing one in only
+ * moves the allocation off this thread; the admission decision, the event-loop
+ * registration and connAccept() all still happen here, on the main thread. */
+void acceptCommonHandlerWithClient(connection *conn, struct ClientFlags flags, char *ip, client *c) {
     char addr[CONN_ADDR_STR_LEN] = {0};
     char laddr[CONN_ADDR_STR_LEN] = {0};
     connFormatAddr(conn, addr, sizeof(addr), 1);
@@ -2082,6 +2132,10 @@ void acceptCommonHandler(connection *conn, struct ClientFlags flags, char *ip) {
     if (connGetState(conn) != CONN_STATE_ACCEPTING) {
         serverLog(LL_VERBOSE, "Accepted client connection in error state: %s (addr=%s laddr=%s)",
                   connGetLastError(conn), addr, laddr);
+        if (c) {
+            connSetPrivateData(conn, NULL);
+            freeUnattachedClient(c);
+        }
         connClose(conn);
         return;
     }
@@ -2111,13 +2165,21 @@ void acceptCommonHandler(connection *conn, struct ClientFlags flags, char *ip) {
         if (is_prioritized) {
             server.stat_rejected_priority_conn++;
         }
+        /* A worker may have built a client before this check could run: the
+         * headroom it was given is a snapshot, not a reservation. */
+        if (c) {
+            connSetPrivateData(conn, NULL);
+            freeUnattachedClient(c);
+        }
         connClose(conn);
         return;
     }
     /* Set the priority of the connection */
     connSetPriority(conn, is_prioritized);
     /* Create connection and client */
-    if ((c = createClient(conn)) == NULL) {
+    if (c) {
+        attachClient(c);
+    } else if ((c = createClient(conn)) == NULL) {
         serverLog(LL_WARNING, "Error registering fd event for the new client connection: %s (addr=%s laddr=%s)",
                   connGetLastError(conn), addr, laddr);
         connClose(conn); /* May be already closed, just ignore errors */

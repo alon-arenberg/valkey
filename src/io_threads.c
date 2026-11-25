@@ -1183,14 +1183,18 @@ static void ioThreadAccept(client *c) {
     sendToMainThread(c, JOB_RES_READ_CLIENT);
 }
 
-/* Worker side of the accept() offload: drain one listening socket's backlog
- * into the job's result array.
+/* Worker side of the accept() offload: drain one listening socket's backlog and
+ * build as much of each connection as can be built off the main thread.
  *
- * Only the socket itself is touched here. anetTcpAccept() does accept4() plus
- * TCP_NODELAY, and anetKeepAlive() is a setsockopt on the socket we just got,
- * so neither reads nor writes shared server state. Everything that does -
- * admission control, createClient(), connAccept() - is left to the main thread
- * in handleAcceptSyscallJob().
+ * Per connection the worker does the accept4(), the per-socket setup, the
+ * connection object (for TLS that includes SSL_new(), which is thread safe on a
+ * shared SSL_CTX) and - while the admission headroom snapshot allows it - the
+ * client allocation and field init. That last part is the expensive one: a
+ * client struct plus a 16k reply buffer plus a reply list per connection.
+ *
+ * What stays on the main thread is everything that mutates state the main
+ * thread owns: the admission decision, selectDb(), the read handler on the
+ * event loop, the client list and id index, and connAccept().
  *
  * Errors are reported back as an errno rather than logged, because serverLog()
  * is not for workers. */
@@ -1223,6 +1227,14 @@ static void ioThreadAcceptSyscall(acceptIOJob *job) {
 
         if (!job->unix_socket && keepalive) anetKeepAlive(NULL, cfd, keepalive);
         r->fd = cfd;
+        r->conn = connCreateAccepted(job->listener->ct, cfd, job->accept_priv);
+        /* Pre-build a client only while the headroom snapshot says one can
+         * still be admitted, and never for a connection that failed to build:
+         * the main thread closes those without creating a client. */
+        if (job->accepted < job->client_headroom && connGetState(r->conn) == CONN_STATE_ACCEPTING)
+            r->client = createClientUnattached(r->conn);
+        else
+            r->client = NULL;
         job->accepted++;
     }
 
@@ -1261,8 +1273,12 @@ static void handleAcceptSyscallJob(acceptIOJob *job) {
         } else {
             serverLog(LL_VERBOSE, "Accepted %s:%d", r->ip, r->port);
         }
-        acceptCommonHandler(connCreateAccepted(job->listener->ct, r->fd, job->accept_priv), flags,
-                            job->unix_socket ? NULL : r->ip);
+        /* r->client is the client the worker pre-built, or NULL when the
+         * headroom ran out; acceptCommonHandlerWithClient() builds one itself
+         * in that case. */
+        acceptCommonHandlerWithClient(r->conn, flags, job->unix_socket ? NULL : r->ip, r->client);
+        r->conn = NULL;
+        r->client = NULL;
     }
     server.stat_io_accept_syscall_offloaded += job->accepted;
 
@@ -1332,6 +1348,17 @@ int trySendAcceptSyscallToIOThreads(connListener *listener,
     job->unix_socket = unix_socket;
     job->max_per_cycle = max_per_cycle < IO_ACCEPT_BATCH_MAX ? max_per_cycle : IO_ACCEPT_BATCH_MAX;
     if (job->max_per_cycle < 1) job->max_per_cycle = 1;
+    /* Snapshot the admission headroom so the worker pre-builds clients only
+     * while there is a chance of admitting them. Under a connection flood the
+     * authoritative check on the main thread would otherwise reject clients the
+     * worker had already allocated, which is the one case where offloading the
+     * allocation would cost more than it saves. The snapshot can go stale
+     * downward while the job runs; one client too many just costs a
+     * freeUnattachedClient(). */
+    long long admitted = (long long)listLength(server.clients) + (long long)getClusterConnectionsCount();
+    long long headroom = (long long)server.maxclients - admitted;
+    if (headroom < 0) headroom = 0;
+    job->client_headroom = headroom > job->max_per_cycle ? job->max_per_cycle : (int)headroom;
     job->accepted = 0;
     job->saturated = 0;
     job->err_errno = 0;
@@ -1371,7 +1398,22 @@ void cancelListenerAcceptOffload(connListener *listener) {
              * listener close is a config change or shutdown, not a hot path. */
         }
 
-        for (int i = 0; i < job->accepted; i++) close(job->results[i].fd);
+        for (int i = 0; i < job->accepted; i++) {
+            acceptIOResult *r = &job->results[i];
+            if (r->client) {
+                /* The connection is about to go away; do not leave it pointing
+                 * at a client we are freeing. */
+                connSetPrivateData(r->conn, NULL);
+                freeUnattachedClient(r->client);
+                r->client = NULL;
+            }
+            if (r->conn) {
+                connClose(r->conn); /* closes the socket too */
+                r->conn = NULL;
+            } else {
+                close(r->fd);
+            }
+        }
         job->accepted = 0;
         job->discard = 1;
     }

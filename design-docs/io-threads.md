@@ -251,24 +251,37 @@ completes) and `cluster_io_main_thread_fallbacks`.
 
 ## Accept Offload (POC)
 
-`io-threads-accept-offload` (off by default) moves the `accept()` syscall off
-the main thread. Without it, every new connection is accepted and admitted
-inline on the main thread inside the listener's readable handler, which makes
-the main thread the bottleneck during a connection burst.
+`io-threads-accept-offload` (off by default) moves the `accept()` syscall and
+the per-connection setup around it onto a worker. Without it, every new
+connection is accepted, built and admitted inline on the main thread inside the
+listener's readable handler, which makes the main thread the bottleneck during a
+connection burst.
 
 ### What moves and what does not
 
-The split follows the usual rule: a worker may touch only the socket it has just
-accepted, which nothing else can see yet.
+The split follows the usual rule: a worker may touch only the connection it has
+just accepted, which nothing else can see yet.
 
 | Step | Thread | Why |
 |---|---|---|
 | `accept4()` on the listening socket | worker | the socket is the only shared thing, and the kernel serializes it |
 | `TCP_NODELAY`, `SO_KEEPALIVE` | worker | setsockopt on the new socket |
-| `connCreateAccepted()` | main | allocation only, but see the next increment |
+| `connCreateAccepted()` (incl. `SSL_new()` for TLS) | worker | allocation plus, for TLS, a thread-safe call on a shared `SSL_CTX` |
+| `createClientUnattached()` | worker | client struct, 16k reply buffer, reply list, ~90 field stores, all client-local |
 | admission control (`maxclients`, priority subnets) | main | reads the client list, writes the rejection counters |
-| `createClient()` | main | mutates the event loop, `server.clients` and the client id index |
+| `selectDb()` | main | can create a database |
+| `connSetReadHandler()` | main | mutates the event loop |
+| `linkClient()` | main | mutates `server.clients` and the client id index |
 | `connAccept()` → `clientAcceptHandler()` | main | protected-mode checks, connection counters, module events |
+
+`createClient()` is therefore split into `createClientUnattached()` (worker-safe)
+and `attachClient()` (main thread only), with `freeUnattachedClient()` for a
+client that was built but never published. `createClient()` is the two called
+back to back, so nothing else in the tree changes behavior.
+
+The remaining main-thread work is the part that mutates the event loop and the
+global client registry. Moving that too needs per-worker event loops, which is a
+different architecture, not a bigger job kind.
 
 ### Queue routing
 
@@ -291,12 +304,21 @@ and the event loop spins on it while a worker is already draining it. The
 completion handler re-arms it; because epoll is level triggered, a backlog that
 the batch cap cut short refires on the next poll.
 
+### Admission headroom
+
+A worker that allocated a client the main thread then rejects has done worse
+than no offload at all, and `maxclients` rejection is exactly a connection-flood
+scenario. So the dispatcher snapshots `maxclients - admitted` into the job and
+the worker pre-builds clients only up to that many. The snapshot is a hint, not
+a reservation: the authoritative check still runs on the main thread, and a
+client built one too many costs one `freeUnattachedClient()`.
+
 ### Listener close
 
 `cancelListenerAcceptOffload()` runs before a listener's sockets are closed. It
-waits for any in-flight job to publish its results, then closes the sockets it
-accepted. The wait matters: closing the listening socket while a worker sits in
-`accept()` could hand that worker a recycled fd number.
+waits for any in-flight job to publish its results, then closes the connections
+it accepted. The wait matters: closing the listening socket while a worker sits
+in `accept()` could hand that worker a recycled fd number.
 
 The job's `in_flight` flag deliberately stays set until its response is
 consumed, so a re-created listener cannot hand the same slot to a second worker
@@ -311,8 +333,8 @@ listener accepts inline.
 - At process exit a worker can be cancelled inside `accept()`, since `accept()`
   is a POSIX cancellation point. The socket leaks into the dying process. Live
   reconfiguration is unaffected: it drains the queues before joining a worker.
-- Workers read `server.tcpkeepalive` without synchronization, as other worker
-  paths already do.
+- Workers read `server.tcpkeepalive` and `DefaultUser->flags` without
+  synchronization, as other worker paths already do.
 - RDMA keeps the inline accept path.
 
 ## Relevant Code
@@ -322,7 +344,9 @@ listener accepts inline.
   `ioThreadAcceptSyscall`, `cancelListenerAcceptOffload`).
 - `src/queues.{c,h}` — SPMC, MPSC, and SPSC queue primitives.
 - `src/networking.c` — client read/write handlers invoked from worker job
-  dispatch (`ioThreadReadQueryFromClient`, `ioThreadWriteToClient`).
+  dispatch (`ioThreadReadQueryFromClient`, `ioThreadWriteToClient`), and the
+  client creation split (`createClientUnattached`, `attachClient`,
+  `freeUnattachedClient`, `acceptCommonHandlerWithClient`).
 - `src/socket.c`, `src/unix.c`, `src/tls.c` — listener accept handlers that
   hand their backlog to a worker before falling back to the inline loop.
 - `src/cluster_legacy.c` — cluster bus worker jobs (`clusterReadJob`,

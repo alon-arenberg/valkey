@@ -57,17 +57,20 @@ typedef struct acceptIOResult {
     int fd;                  /* the accepted socket */
     int port;                /* peer port, 0 for unix sockets */
     char ip[NET_IP_STR_LEN]; /* peer address, empty for unix sockets */
+    connection *conn;        /* built by the worker; may be in an error state */
+    client *client;          /* pre-built by the worker, NULL if it did not */
 } acceptIOResult;
 
 typedef struct acceptIOJob {
     /* Main thread owns these. Stable while the job is in flight. */
     connListener *listener;
     int listen_fd;
-    void *accept_priv; /* passed to ct->conn_create_accepted() */
-    int unix_socket;   /* 1: no peer address, no keepalive */
-    int max_per_cycle; /* accept() attempts allowed for one job */
-    int in_flight;     /* queued or running; cleared when the response lands */
-    int discard;       /* listener closed under the job: drop its response */
+    void *accept_priv;    /* passed to ct->conn_create_accepted() */
+    int unix_socket;      /* 1: no peer address, no keepalive */
+    int max_per_cycle;    /* accept() attempts allowed for one job */
+    int client_headroom;  /* clients the worker may pre-build for this job */
+    int in_flight;        /* queued or running; cleared when the response lands */
+    int discard;          /* listener closed under the job: drop its response */
 
     /* Worker writes these, main thread reads them after `done` is set or after
      * the response is dequeued. */
